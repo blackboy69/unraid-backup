@@ -112,7 +112,38 @@ This setup prioritizes:
 
 ## 5. Installation & Setup
 
-Follow these steps carefully on your **Backup Server (Debian VM)** to install and configure the backup system.
+This section outlines the steps to get your backup system running. You can choose the automated script or follow the manual steps.
+
+### 5.1. Automated Installation (Recommended)
+
+An `install.sh` script is provided to streamline the setup process on your **Backup Server (Debian VM)**. This script automates package installations and initial file placements, and guides you through necessary manual configuration steps.
+
+**How to run:**
+1.  Ensure `install.sh` is in your current directory on the Debian VM.
+2.  Make it executable: `chmod +x install.sh`
+3.  Run the script: `bash install.sh`
+
+The script will prompt you to press Enter at various stages and will display instructions for manual actions. Please follow these prompts carefully.
+
+**Manual steps guided by the script include:**
+*   **Sudoers Configuration:** Adding necessary permissions for ZFS and other commands.
+*   **ZFS Pool Creation:** Identifying your disks and creating individual ZFS pools.
+*   **`/etc/fstab` Editing:** Configuring `mergerfs` to pool your ZFS disks.
+*   **`.env` File Creation:** Setting up the environment variables for `mount_up.sh` and `backup.sh`.
+*   **SMB Credentials File:** Creating a secure file for your NAS SMB credentials.
+*   **`backup.sh` Variable Review:** Ensuring all paths and tokens are correctly set (especially if not using `.env` for everything like Pushover tokens).
+*   **Cron Job Setup:** Scheduling the `backup.sh` script to run automatically.
+
+**Before running, have this information ready:**
+*   Your NAS IP address.
+*   Your NAS SMB username and password.
+*   Your Pushover User Key and Application Token (if you plan to use Pushover notifications).
+
+The script references the detailed manual steps below for further context.
+
+### 5.2. Manual Installation Steps
+
+If you prefer to set up everything manually, or wish to understand each step in detail, follow the instructions below. The `install.sh` script also refers to these steps for the manual configuration parts.
 
 1.  **Update Your System:**
     ```bash
@@ -121,7 +152,7 @@ Follow these steps carefully on your **Backup Server (Debian VM)** to install an
     ```
 
 2.  **Install Necessary Packages:**
-    * `backup.sh` and `mount_up.sh` require several utilities.
+    * `install.sh`, `backup.sh` and `mount_up.sh` require several utilities.
     * `cifs-utils`: For mounting SMB shares.
     * `samba-client`: For `smbclient` (used by `mount_up.sh` to discover shares).
     * `util-linux`: For `findmnt` (used by `mount_up.sh`).
@@ -184,13 +215,13 @@ Follow these steps carefully on your **Backup Server (Debian VM)** to install an
 
 7.  **Set Up `mount_up.sh` for SMB Share Mounting:**
     * `backup.sh` relies on `mount_up.sh` to handle the discovery, mounting, and unmounting of SMB shares.
-    * **Place `mount_up.sh`:** Copy the `mount_up.sh` script to `/usr/local/bin/`:
+    * **Place `mount_up.sh`:** Copy the `mount_up.sh` script to `/usr/local/bin/`. (Note: `install.sh` can do this for you if the script is in the same directory during installation).
         ```bash
         # Assuming mount_up.sh is in your current directory or you have the correct path
         sudo cp mount_up.sh /usr/local/bin/mount_up.sh
         sudo chmod +x /usr/local/bin/mount_up.sh
         ```
-    * **Create `.env` Configuration File:** `mount_up.sh` (and `backup.sh`) uses an environment file for configuration. Create `/usr/local/bin/.env` (or in the same directory as the scripts if you prefer, and adjust `ENV_FILE` in `backup.sh`).
+    * **Create `.env` Configuration File:** `mount_up.sh` (and `backup.sh`) uses an environment file for configuration. Create `/usr/local/bin/.env` (or in the same directory as the scripts if you prefer, and adjust `ENV_FILE` in `backup.sh`). (Note: `install.sh` will guide you in creating this file).
         ```bash
         sudo nano /usr/local/bin/.env
         ```
@@ -253,13 +284,13 @@ Configuration for `backup.sh` is managed through a combination of variables with
 
 ## 7. Usage
 
-1.  **Place `backup.sh` Script:** Save the `backup.sh` script content (from this repository) as `/usr/local/bin/backup.sh` on your Debian VM.
+1.  **Place `backup.sh` Script:** Save the `backup.sh` script content (from this repository) as `/usr/local/bin/backup.sh` on your Debian VM. (Note: `install.sh` can do this for you if the script is in the same directory during installation).
     ```bash
     # Ensure you have backup.sh in your current directory or provide the correct path from where you cloned/downloaded it
     sudo cp backup.sh /usr/local/bin/backup.sh
     sudo chmod +x /usr/local/bin/backup.sh
     ```
-    *(Make sure `mount_up.sh` is also placed and made executable as per Step 5.7 "Set Up `mount_up.sh`...")*
+    *(Make sure `mount_up.sh` is also placed and made executable as per Step 5.2.7 "Set Up `mount_up.sh`...")*
 
 2.  **Test Run (Manually):**
     * It's highly recommended to run the script manually first to ensure `mount_up.sh` mounts the shares correctly and `backup.sh` starts the rsync process as expected.
