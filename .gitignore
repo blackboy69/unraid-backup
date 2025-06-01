@@ -1,2 +1,3 @@
 # Ignore the test environment directory
+.env
 test_environment/
