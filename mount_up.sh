@@ -38,7 +38,8 @@ load_env() {
     fi
 
     # Check .env file permissions (should be 600 for sensitive info, though credentials are now external)
-    local env_permissions=$(stat -c "%a" "${ENV_FILE}")
+    local env_permissions
+    env_permissions=$(stat -c "%a" "${ENV_FILE}")
     if [[ "$env_permissions" != "600" ]]; then
         log_message "Warning: .env file '${ENV_FILE}' has insecure permissions (${env_permissions})."
         log_message "It should be 600 (rw-------). Please fix with: chmod 600 ${ENV_FILE}"
@@ -48,6 +49,7 @@ load_env() {
 
     # Source the .env file to load variables into the current script's environment
     set -a # Automatically export all variables after this point
+    # shellcheck source=./.env
     source "${ENV_FILE}"
     set +a # Stop automatically exporting variables
 
@@ -65,7 +67,8 @@ load_env() {
         log_message "Please create it with 'username=...' and 'password=...' and ensure it has 600 permissions."
         exit 1
     fi
-    local cred_permissions=$(stat -c "%a" "${SMB_CREDENTIALS_PATH}")
+    local cred_permissions
+    cred_permissions=$(stat -c "%a" "${SMB_CREDENTIALS_PATH}")
     if [[ "$cred_permissions" != "600" ]]; then
         log_message "Error: SMB Credentials file '${SMB_CREDENTIALS_PATH}' has insecure permissions (${cred_permissions})."
         log_message "It MUST be 600 (rw-------). Please fix with: sudo chmod 600 ${SMB_CREDENTIALS_PATH}"
@@ -78,7 +81,7 @@ load_env() {
 discover_smb_shares() {
     local server_ip="$1"
     log_message "Discovering SMB shares on ${server_ip}..."
-    
+
     # smbclient might still need a username even if password is not passed directly
     # -U %username: tells smbclient to use the username from its configuration/env if available.
     # We use the SMB_USERNAME from .env for this.
@@ -149,9 +152,10 @@ unmount_smb_share() {
 # Function to unmount all shares previously managed by this script
 unmount_all_existing_smb_shares() {
     log_message "Clearing out all existing SMB mounts under ${MOUNT_BASE_DIR}..."
-    
+
     # Find all CIFS mounts under MOUNT_BASE_DIR
-    local existing_mounts=$(findmnt -l -t cifs -n -o TARGET -r | grep "^${MOUNT_BASE_DIR}/")
+    local existing_mounts
+    existing_mounts=$(findmnt -l -t cifs -n -o TARGET -r | grep "^${MOUNT_BASE_DIR}/")
 
     if [[ -z "${existing_mounts}" ]]; then
         log_message "No existing SMB mounts found under ${MOUNT_BASE_DIR} to unmount."
@@ -171,10 +175,10 @@ check_prerequisites() {
     command -v smbclient >/dev/null || missing_commands+=("smbclient (samba-client)")
     command -v mount.cifs >/dev/null || missing_commands+=("mount.cifs (cifs-utils)") # mount.cifs is provided by cifs-utils
     command -v findmnt >/dev/null || missing_commands+=("findmnt (util-linux)") # for robust mount point detection
-    
+
     if [ ${#missing_commands[@]} -gt 0 ]; then
         log_message "Error: The following commands are missing. Please install the corresponding packages."
-        log_message "Missing: ${missing_commands[@]}"
+        log_message "Missing: ${missing_commands[*]}"
         log_message "On Debian/Ubuntu, you might need to run:"
         log_message "  sudo apt-get update"
         log_message "  sudo apt-get install samba-client cifs-utils util-linux"
@@ -186,8 +190,42 @@ check_prerequisites() {
 main() {
     log_message "Starting SMB Mount Manager script."
 
+    # Check for --unmount-only flag first
+    if [[ "$1" == "--unmount-only" ]]; then
+        log_message "Running in --unmount-only mode."
+        # Load environment variables necessary for unmounting
+        # Determine script directory to find .env relative to script
+        local script_dir
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+        ENV_FILE="${script_dir}/.env" # Assume .env is in the same directory as the script
+
+        if [[ ! -f "${ENV_FILE}" ]]; then # Fallback if script_dir logic fails (e.g. direct execution)
+             ENV_FILE="./.env"
+        fi
+
+        # A simplified load_env for unmounting, only MOUNT_BASE_DIR is strictly needed
+        if [[ -f "${ENV_FILE}" ]]; then
+            set -a
+            # shellcheck source=./.env
+            source "${ENV_FILE}"
+            set +a
+            if [[ -z "${MOUNT_BASE_DIR}" ]]; then
+                log_message "Error: MOUNT_BASE_DIR not found in ${ENV_FILE}. Cannot unmount."
+                exit 1
+            fi
+            log_message "Environment loaded for unmount. MOUNT_BASE_DIR: ${MOUNT_BASE_DIR}"
+        else
+            log_message "Error: .env file '${ENV_FILE}' not found. Cannot determine MOUNT_BASE_DIR for unmounting."
+            exit 1
+        fi
+
+        unmount_all_existing_smb_shares
+        log_message "Unmount-only mode finished."
+        exit 0
+    fi
+
     check_prerequisites
-    load_env # Load all variables from .env file
+    load_env # Load all variables from .env file (this also checks for .env existence and permissions)
 
     # Ensure the base mount directory exists
     if [ ! -d "${MOUNT_BASE_DIR}" ]; then
@@ -199,15 +237,21 @@ main() {
     fi
 
     # Phase 1: Unmount all existing shares that were managed by this script
+    # This is always done to ensure a clean state before attempting new mounts.
     unmount_all_existing_smb_shares
 
     # Phase 2: Discover and mount current shares
-    local discovered_shares=($(discover_smb_shares "${SERVER_IP}"))
+    local discovered_shares_output
+    discovered_shares_output=$(discover_smb_shares "${SERVER_IP}")
+    mapfile -t discovered_shares < <(echo "${discovered_shares_output}")
     local current_run_mounted_paths=() # Keep track of what we successfully mount in THIS run
 
     if [ ${#discovered_shares[@]} -eq 0 ]; then
         log_message "No SMB shares found on ${SERVER_IP} or an error occurred during discovery."
         log_message "No shares will be mounted in this run."
+        # This is not an error state, could be normal if no shares are available.
+        # unmount_all_existing_smb_shares already ran.
+        log_message "SMB mount management run complete. No shares to mount."
         exit 0
     fi
 
@@ -215,8 +259,10 @@ main() {
 
     log_message "Attempting to mount current discovered shares..."
     for share in "${discovered_shares[@]}"; do
+        if [[ -z "$share" ]]; then continue; fi # Skip empty lines if any from mapfile
         # Sanitize share name for directory creation (replace non-alphanumeric with underscore)
-        local sanitized_share_name=$(echo "${share}" | sed 's/[^a-zA-Z0-9_-]/_/g')
+        local sanitized_share_name
+        sanitized_share_name=${share//[^a-zA-Z0-9_-]/_}
         local mount_point="${MOUNT_BASE_DIR}/${SERVER_IP//./_}_${sanitized_share_name}"
 
         if mount_smb_share "${SERVER_IP}" "${share}" "${mount_point}" "${SMB_USERNAME}"; then
@@ -230,9 +276,9 @@ main() {
         for mp in "${current_run_mounted_paths[@]}"; do
             log_message "- ${mp}"
         done
-        log_message "These shares will remain mounted until manually unmounted or this script runs again."
+        log_message "These shares will remain mounted until manually unmounted or this script runs again (or unmount-only is called)."
     else
-        log_message "No new shares were successfully mounted in this run."
+        log_message "No new shares were successfully mounted in this run (despite shares being discovered)."
     fi
 
     log_message "Script finished."
