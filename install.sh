@@ -6,15 +6,34 @@ echo "This script will automate some installation steps and guide you through ma
 echo "You will be prompted to press Enter to continue at various stages."
 read -p "Press Enter to continue..."
 
-# Update and upgrade the system
-echo "INFO: Updating and upgrading the system..."
+# Update and upgrade the system (initial)
+echo "INFO: Performing initial system update and upgrade..."
 sudo apt update && sudo apt upgrade -y
-echo "INFO: System update and upgrade complete."
+echo "INFO: Initial system update and upgrade complete."
 read -p "Press Enter to continue..."
 
+# APT sources configuration for ZFS
+echo "MANUAL STEP: Configure APT sources for ZFS."
+echo "ZFS packages are often found in 'contrib' or 'non-free' sections of the Debian repository, or in backports."
+echo "1. Edit your APT sources file: sudo nano /etc/apt/sources.list"
+echo "2. For your Debian release line (e.g., 'bookworm'), ensure 'contrib', 'non-free', and 'non-free-firmware' are present."
+echo "   Example for Debian <your_debian_codename>:"
+echo "   deb http://deb.debian.org/debian/ <your_debian_codename> main contrib non-free non-free-firmware"
+echo "   (Replace '<your_debian_codename>' with your actual Debian version codename, e.g., bullseye, bookworm)"
+echo "3. Add the backports repository line if it's not already there. This is often recommended for newer ZFS versions."
+echo "   Example for Debian <your_debian_codename>-backports:"
+echo "   deb http://deb.debian.org/debian/ <your_debian_codename>-backports main contrib non-free non-free-firmware"
+echo "   (Again, replace '<your_debian_codename>' accordingly. 'non-free-firmware' is especially relevant for Debian 12+)."
+echo "4. After saving the changes to /etc/apt/sources.list, YOU MUST run 'sudo apt update' to refresh package lists."
+echo "   The script will pause for you to do this."
+read -p "Press Enter after you have verified/updated your APT sources and run 'sudo apt update'..."
+
 # Install necessary packages
-echo "INFO: Installing necessary packages..."
-sudo apt install -y rsync cifs-utils samba-client util-linux zfsutils-linux smartmontools jq curl mergerfs
+echo "INFO: Installing necessary packages (including ZFS specific ones)..."
+echo "This step will install rsync, cifs-utils, samba-client, util-linux, linux-headers-amd64, zfs-dkms, zfsutils-linux, smartmontools, jq, curl, and mergerfs."
+echo "If you enabled backports and want to install ZFS from there, you might typically use '-t <your_debian_codename>-backports install zfsutils-linux zfs-dkms'."
+echo "This script will attempt a standard install which should now work if 'contrib' is enabled."
+sudo apt install -y rsync cifs-utils samba-client util-linux linux-headers-amd64 zfs-dkms zfsutils-linux smartmontools jq curl mergerfs
 echo "INFO: Necessary packages installed."
 read -p "Press Enter to continue..."
 

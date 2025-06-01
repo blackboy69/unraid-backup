@@ -126,6 +126,7 @@ An `install.sh` script is provided to streamline the setup process on your **Bac
 The script will prompt you to press Enter at various stages and will display instructions for manual actions. Please follow these prompts carefully.
 
 **Manual steps guided by the script include:**
+*   **APT Sources Configuration:** Ensuring `contrib`, `non-free`, and `backports` repositories are correctly configured and `apt update` is run.
 *   **Sudoers Configuration:** Adding necessary permissions for ZFS and other commands.
 *   **ZFS Pool Creation:** Identifying your disks and creating individual ZFS pools.
 *   **`/etc/fstab` Editing:** Configuring `mergerfs` to pool your ZFS disks.
@@ -157,13 +158,33 @@ If you prefer to set up everything manually, or wish to understand each step in 
     * `samba-client`: For `smbclient` (used by `mount_up.sh` to discover shares).
     * `util-linux`: For `findmnt` (used by `mount_up.sh`).
     * `rsync`: For transferring files.
-    * `zfsutils-linux`: For ZFS support.
+    * `linux-headers-amd64`: Linux headers, necessary for DKMS modules like ZFS.
+    * `zfs-dkms`: ZFS DKMS package to build kernel modules.
+    * `zfsutils-linux`: ZFS utilities.
     * `smartmontools`: For disk health monitoring.
     * `jq`: For parsing JSON (used by helper functions, if any).
     * `curl`: For Pushover notifications.
     * `mergerfs`: For pooling ZFS disks.
+
+    **IMPORTANT: Configure APT Sources for ZFS**
+    Before installing the packages, especially `zfsutils-linux` and `zfs-dkms`, you need to ensure your system's APT package manager can find them. These are often located in the `contrib` and `non-free` sections of the Debian repository, which might not be enabled by default.
+    1.  Edit your sources list: `sudo nano /etc/apt/sources.list`
+    2.  For your main Debian release line (e.g., for `bookworm`), ensure it includes `contrib non-free non-free-firmware`. It should look something like this (replace `<your_debian_codename>` with your actual release, e.g., `bullseye`, `bookworm`):
+        ```
+        deb http://deb.debian.org/debian/ <your_debian_codename> main contrib non-free non-free-firmware
+        ```
+    3.  It's also highly recommended to add the `backports` repository for your Debian release, as this often contains newer versions of ZFS. Add a line like this (again, replace `<your_debian_codename>`):
+        ```
+        deb http://deb.debian.org/debian/ <your_debian_codename>-backports main contrib non-free non-free-firmware
+        ```
+    4.  After saving the file, **you must update the package lists**:
+        ```bash
+        sudo apt update
+        ```
+
+    Now you can install the necessary packages:
     ```bash
-    sudo apt install -y rsync cifs-utils samba-client util-linux zfsutils-linux smartmontools jq curl mergerfs
+    sudo apt install -y rsync cifs-utils samba-client util-linux linux-headers-amd64 zfs-dkms zfsutils-linux smartmontools jq curl mergerfs
     ```
 
 3.  **Configure Sudoers:**
