@@ -182,40 +182,75 @@ Follow these steps carefully on your **Backup Server (Debian VM)** to install an
         ```
     * Verify it's mounted: `mount -l | grep mergerfs`
 
-7.  **Set Up `mount_up.sh` for SMB Share Mounting:**
-    * `backup.sh` relies on `mount_up.sh` to handle the discovery, mounting, and unmounting of SMB shares.
-    * **Place `mount_up.sh`:** Copy the `mount_up.sh` script to `/usr/local/bin/`:
-        ```bash
-        # Assuming mount_up.sh is in your current directory or you have the correct path
-        sudo cp mount_up.sh /usr/local/bin/mount_up.sh
-        sudo chmod +x /usr/local/bin/mount_up.sh
-        ```
-    * **Create `.env` Configuration File:** `mount_up.sh` (and `backup.sh`) uses an environment file for configuration. Create `/usr/local/bin/.env` (or in the same directory as the scripts if you prefer, and adjust `ENV_FILE` in `backup.sh`).
-        ```bash
-        sudo nano /usr/local/bin/.env
-        ```
-        Add the following content, adjusting values for your environment:
-        ```dotenv
-        # .env configuration for mount_up.sh and backup.sh
-        MOUNT_BASE_DIR="/mnt/smb_shares" # Base directory where NAS shares will be mounted
-        DEFAULT_MOUNT_OPTIONS="ro,iocharset=utf8,vers=3.0,uid=0,gid=0,forceuid,forcegid,file_mode=0644,dir_mode=0755" # Default SMB mount options (read-only is crucial)
-        SERVER_IP="YOUR_NAS_IP_ADDRESS" # IP address of your NAS
-        SMB_USERNAME="smb_backup_user" # SMB username for your NAS
-        SMB_CREDENTIALS_PATH="/root/.smb_credentials_backup" # Path to the SMB credentials file
+6.  **Place Scripts & Configure `mount_up.sh`:**
+    *   `backup.sh` now works with several helper scripts:
+        *   `backup_config.sh` (defines default configurations)
+        *   `logging_utils.sh` (provides notification functions)
+        *   `system_checks.sh` (provides health check functions)
+        *   `rsync_operations.sh` (provides rsync backup function)
+        *   `snapshot_utils.sh` (provides btrfs snapshot functions)
+    *   All these helper scripts **must be located in the same directory** as `backup.sh`.
+    *   A recommended location for `backup.sh` and its helpers is a dedicated directory, e.g., `/usr/local/bin/backup_scripts/`.
+    *   `mount_up.sh` handles SMB share mounting. It can be placed in the same directory or a standard PATH directory (e.g., `/usr/local/bin/`). The `MOUNT_UP_SCRIPT` variable in `backup.sh` defaults to `/usr/local/bin/mount_up.sh`; adjust if needed.
+    ```bash
+    # Example: Create a dedicated directory and copy all scripts
+    sudo mkdir -p /usr/local/bin/backup_scripts/
+    # Assuming you have downloaded the repository or have all scripts (backup.sh and helpers) in your current directory:
+    sudo cp backup.sh backup_config.sh logging_utils.sh system_checks.sh rsync_operations.sh snapshot_utils.sh /usr/local/bin/backup_scripts/
 
-        # Optional: Pushover tokens can also be placed here and loaded by backup.sh
-        # PUSHOVER_APP_TOKEN="YOUR_PUSHOVER_APP_TOKEN"
-        # PUSHOVER_USER_KEY="YOUR_PUSHOVER_USER_KEY"
-        ```
-        Set strict permissions for the `.env` file:
+    # Place mount_up.sh (example: to /usr/local/bin/)
+    sudo cp mount_up.sh /usr/local/bin/mount_up.sh
+
+    # Make all scripts in the backup_scripts directory executable
+    sudo chmod +x /usr/local/bin/backup_scripts/*.sh
+    # Ensure mount_up.sh is executable
+    sudo chmod +x /usr/local/bin/mount_up.sh
+    ```
+
+7.  **Create `.env` Configuration File:**
+    *   This file stores environment-specific settings, sensitive data (like credential paths), and overrides for defaults set in `backup_config.sh`.
+    *   It **must be located in the same directory as `backup.sh`** (e.g., `/usr/local/bin/backup_scripts/.env`). The `ENV_FILE` variable in `backup.sh` is configured to find it there.
         ```bash
-        sudo chmod 600 /usr/local/bin/.env
+        # Example: If backup.sh is in /usr/local/bin/backup_scripts/
+        sudo nano /usr/local/bin/backup_scripts/.env
         ```
-    * **Create SMB Credentials File:** Create the file specified by `SMB_CREDENTIALS_PATH` in your `.env` file. For example, if using `/root/.smb_credentials_backup`:
+    *   Add content like the following, adjusting for your setup. This `.env` file provides settings for both `backup.sh` and the parameters needed by `mount_up.sh`.
+        ```dotenv
+        # .env configuration for backup.sh and mount_up.sh integration
+
+        # --- Settings for mount_up.sh (and used by backup.sh to find shares) ---
+        MOUNT_BASE_DIR="/mnt/smb_shares" # Base directory where NAS shares will be mounted by mount_up.sh
+        SERVER_IP="YOUR_NAS_IP_ADDRESS" # IP address of your NAS
+
+        # --- Settings primarily for mount_up.sh ---
+        # These are standard for mount_up.sh; ensure they are appropriate for your setup.
+        DEFAULT_MOUNT_OPTIONS="ro,iocharset=utf8,vers=3.0,uid=0,gid=0,forceuid,forcegid,file_mode=0644,dir_mode=0755" # Read-only is crucial for backup source
+        SMB_USERNAME="smb_backup_user" # SMB username for your NAS (read-only access)
+        SMB_CREDENTIALS_PATH="/root/.smb_credentials_backup" # Secure path to SMB credentials file
+
+        # --- Overrides for backup_config.sh (for backup.sh) ---
+        # Optional: Override Pushover tokens if not using defaults from backup_config.sh
+        # PUSHOVER_APP_TOKEN="your_actual_app_token"
+        # PUSHOVER_USER_KEY="your_actual_user_key"
+
+        # Optional: Override storage layout, retention policies, or log file path from backup_config.sh
+        # BTRFS_MOUNT_POINTS="/mnt/btrfs_driveX /mnt/btrfs_driveY"
+        # DEST_ROOT="/media/backup_pool"
+        # LOG_FILE="/var/log/custom_backup.log"
+        # KEEP_DAILY=5
+        # KEEP_WEEKLY=3
+        ```
+    *   Set strict permissions for the `.env` file:
         ```bash
+        # Example: if .env is in /usr/local/bin/backup_scripts/
+        sudo chmod 600 /usr/local/bin/backup_scripts/.env
+        ```
+    *   **Create SMB Credentials File:** As referenced by `SMB_CREDENTIALS_PATH` in `.env`. This file contains the actual username and password for the SMB share.
+        ```bash
+        # Example path from .env: /root/.smb_credentials_backup
         sudo nano /root/.smb_credentials_backup
         ```
-        Add the username and password for your NAS SMB user:
+        Add content like:
         ```
         username=smb_backup_user
         password=YOUR_ACTUAL_SMB_PASSWORD
@@ -229,56 +264,62 @@ Follow these steps carefully on your **Backup Server (Debian VM)** to install an
 
 ## 6. Configuration
 
-Configuration for `backup.sh` is managed through a combination of variables within the script itself and the shared `.env` file.
+Configuration for the backup system is managed through two main files located in the script directory (e.g. `/usr/local/bin/backup_scripts/`):
+*   **`backup_config.sh`**: This script is sourced by `backup.sh` and defines the **default** values for all configuration variables (e.g., Pushover tokens, rsync exclusions, destination paths, BTRFS mount points, snapshot retention policies, log file path). You can review this file to see the defaults.
+*   **`.env` File**: This file (e.g., `/usr/local/bin/backup_scripts/.env`) is for your **local overrides and sensitive data**.
+    *   It's used to provide environment-specific details like `SERVER_IP`, `MOUNT_BASE_DIR` (which `backup.sh` uses to find shares mounted by `mount_up.sh`), and `SMB_CREDENTIALS_PATH`.
+    *   Crucially, any variable set in `.env` will **override** the default value set in `backup_config.sh`. This is the recommended way to customize the backup behavior without modifying the core scripts. For example, set your actual `PUSHOVER_APP_TOKEN`, `BTRFS_MOUNT_POINTS`, `LOG_FILE`, or adjust snapshot retention policies here.
 
-**Shared `.env` File (e.g., `/usr/local/bin/.env`):**
-*   **`MOUNT_BASE_DIR`:** (Required by `backup.sh`) Base directory where `mount_up.sh` mounts shares. `backup.sh` uses this to find the mounted shares.
-*   **`SERVER_IP`:** (Required by `backup.sh`) IP address of your NAS. `backup.sh` uses this to help identify mounted shares.
-*   Other variables like `DEFAULT_MOUNT_OPTIONS`, `SMB_USERNAME`, `SMB_CREDENTIALS_PATH` are used by `mount_up.sh` for mounting.
-*   You can optionally move `PUSHOVER_APP_TOKEN` and `PUSHOVER_USER_KEY` to this `.env` file. `backup.sh` will load them if present.
+**Key Variables (Defaults in `backup_config.sh`, override in `.env`):**
+*   `ENV_FILE`: Variable within `backup.sh` that points to your `.env` file (automatically `${SCRIPT_DIR}/.env`).
+*   `SCRIPT_DIR`: Variable within `backup.sh` that stores the path to the directory containing the scripts.
+*   `PUSHOVER_APP_TOKEN`, `PUSHOVER_USER_KEY`: For Pushover notifications.
+*   `RSYNC_EXCLUDES`: Array of patterns for rsync exclusions.
+*   `DEST_ROOT`, `DEST_SUBDIR`, `FINAL_DEST`: Define the backup destination.
+*   `BTRFS_MOUNT_POINTS`: Space-separated list of your btrfs filesystem mount points.
+*   `SNAPSHOT_PREFIX`, `KEEP_DAILY`, `KEEP_WEEKLY`, `KEEP_MONTHLY`, `KEEP_YEARLY`: Snapshot configuration.
+*   `LOG_FILE`: Path to the main log file.
+*   `MOUNT_UP_SCRIPT`: Path to `mount_up.sh` (defaults to `/usr/local/bin/mount_up.sh`).
 
-**Internal `backup.sh` Variables:**
-*   **`ENV_FILE`:** Path to the `.env` file. Defaults to `$(dirname "$0")/.env`, meaning it expects `.env` in the same directory as `backup.sh`. If your `.env` is at `/usr/local/bin/.env` and `backup.sh` is also there, this default is fine.
-*   **`PUSHOVER_APP_TOKEN` / `PUSHOVER_USER_KEY`:** Your Pushover API credentials (can be set in script if not found in `.env`).
-*   **`SOURCE_FOLDERS`:** This variable is **dynamically populated** by `backup.sh`. It discovers mounted shares created by `mount_up.sh` based on `MOUNT_BASE_DIR` and `SERVER_IP` (read from the `.env` file). You no longer define this manually in the script.
-*   **`RSYNC_EXCLUDES`:** An array of `rsync` patterns to exclude files or directories globally.
-*   **`DEST_ROOT`:** The mount point of your `mergerfs` pool (e.g., `/mnt/merged_pool`).
-* **`DEST_SUBDIR`:** An optional subdirectory within `DEST_ROOT` for your backups (e.g., `nas_backups`).
-* **`ZFS_POOLS`:** A space-separated list of the *names* of your individual ZFS pools on your Debian VM (e.g., `pool_disk1 pool_disk2`).
-* **`SNAPSHOT_PREFIX`:** The prefix for your ZFS snapshot names (e.g., `backup`).
-* **`KEEP_DAILY`, `KEEP_WEEKLY`, `KEEP_MONTHLY`, `KEEP_YEARLY`:** Your snapshot retention policy. Set to `0` to disable a specific tier of snapshots.
-* **`LOG_FILE`:** The path to the script's log file (e.g., `/var/log/backup_pull.log`).
+**Dynamic Variables (set by `backup.sh` during runtime):**
+*   `SOURCE_FOLDERS`: This variable is **dynamically populated** by `backup.sh` after `mount_up.sh` successfully mounts shares. **Do not set this manually.**
 
 ---
 
 ## 7. Usage
 
-1.  **Place `backup.sh` Script:** Save the `backup.sh` script content (from this repository) as `/usr/local/bin/backup.sh` on your Debian VM.
-    ```bash
-    # Ensure you have backup.sh in your current directory or provide the correct path from where you cloned/downloaded it
-    sudo cp backup.sh /usr/local/bin/backup.sh
-    sudo chmod +x /usr/local/bin/backup.sh
-    ```
-    *(Make sure `mount_up.sh` is also placed and made executable as per Step 5.7 "Set Up `mount_up.sh`...")*
+1.  **Place & Configure Scripts:**
+    *   Ensure `backup.sh` and its helper scripts (`backup_config.sh`, etc.) are placed in your chosen script directory (e.g., `/usr/local/bin/backup_scripts/`) as per **Installation & Setup Step 6**.
+    *   Create and configure your `.env` file in the same directory as `backup.sh` as per **Installation & Setup Step 7**, providing your specific paths, IPs, credentials path, and any desired overrides for `backup_config.sh`.
+    *   Confirm `mount_up.sh` is correctly placed and executable.
+    *   Make all scripts in your script directory executable:
+        ```bash
+        # Example if scripts are in /usr/local/bin/backup_scripts/
+        sudo chmod +x /usr/local/bin/backup_scripts/*.sh
+        # If mount_up.sh is separate and not covered by above:
+        # sudo chmod +x /usr/local/bin/mount_up.sh
+        ```
 
 2.  **Test Run (Manually):**
-    * It's highly recommended to run the script manually first to ensure `mount_up.sh` mounts the shares correctly and `backup.sh` starts the rsync process as expected.
+    * It's highly recommended to run the script manually first to ensure configurations are correct, `mount_up.sh` mounts shares, and `backup.sh` proceeds as expected.
     ```bash
-    sudo /usr/local/bin/backup.sh
+    # Example if backup.sh is in /usr/local/bin/backup_scripts/
+    sudo /usr/local/bin/backup_scripts/backup.sh
     ```
-    * Monitor the output and the log file: `tail -f /var/log/backup_pull.log` (or your configured `LOG_FILE`).
-    * `mount_up.sh` also generates logs, which `backup.sh` redirects to its own log file. Check these for mount success/failure details.
+    * Monitor the script's output on the console and check the detailed log file (its path is defined by the `LOG_FILE` variable, default is `/var/log/backup_pull.log`).
+    * Check that `mount_up.sh` mounts shares correctly (its logs are captured by `backup.sh`).
 
 3.  **Schedule with Cron:**
-    * Schedule `backup.sh` to run periodically (e.g., daily at 2 AM). Run as `root` or the user configured in `sudoers` (Step 5.3).
+    * Once manual tests are successful, schedule `backup.sh` to run periodically using cron. Run as `root` or the user configured in `sudoers` (Installation Step 3).
     ```bash
     sudo crontab -e
     ```
-    * Add this line:
+    * Add a line pointing to your `backup.sh` script location. For example, if it's in `/usr/local/bin/backup_scripts/` and you want it to run daily at 2 AM:
         ```cron
-        0 2 * * * /usr/local/bin/backup.sh >> /var/log/backup_cron.log 2>&1
+        # Example if backup.sh is in /usr/local/bin/backup_scripts/
+        0 2 * * * /usr/local/bin/backup_scripts/backup.sh >> /var/log/backup_cron.log 2>&1
         ```
-        *(This redirects cron's specific output (if any) to `/var/log/backup_cron.log` for debugging cron execution issues. `backup.sh` itself logs comprehensively to its `LOG_FILE`.)*
+        *(This redirects cron's own STDOUT/STDERR (if any) to `/var/log/backup_cron.log`, which is useful for debugging cron-specific execution problems. The `backup.sh` script itself logs extensively to its configured `LOG_FILE`.)*
 
 ---
 

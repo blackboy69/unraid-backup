@@ -1,17 +1,33 @@
 #!/bin/bash
+# backup.sh - Main backup orchestration script.
+# This script coordinates the backup process, including:
+# - Loading configuration (defaults and from .env).
+# - Mounting SMB shares from a NAS (via mount_up.sh).
+# - Performing rsync backups from the shares to local btrfs filesystems.
+# - Creating and rotating btrfs snapshots on these filesystems.
+# - Checking system and btrfs logs for errors.
+# - Sending status notifications via Pushover.
+#
+# It relies on several helper scripts in the same directory:
+# - backup_config.sh: Defines default configuration variables.
+# - logging_utils.sh: Provides pushover_notify function.
+# - system_checks.sh: Provides check_logs function.
+# - rsync_operations.sh: Provides perform_rsync function.
+# - snapshot_utils.sh: Provides take_snapshots and rotate_snapshots functions.
 
 # --- INSTALLATION INSTRUCTIONS FOR (Debian VM) ---
 # This script (`backup.sh`) runs on your Debian VM.
 # It depends on `mount_up.sh` being in the same directory or /usr/local/bin.
+# Helper scripts (backup_config.sh, etc.) must be in the same directory as backup.sh.
 #
 # 1. Update your system:
 #    sudo apt update
 #    sudo apt upgrade -y
 #
 # 2. Install necessary packages for both backup.sh and mount_up.sh:
-#    (mergerfs is for pooling ZFS disks, cifs-utils for SMB mounts,
+#    (mergerfs is for pooling btrfs disks, cifs-utils for SMB mounts,
 #     samba-client for smbclient, util-linux for findmnt)
-#    sudo apt install -y rsync cifs-utils samba-client util-linux zfsutils-linux smartmontools jq curl mergerfs
+#    sudo apt install -y rsync cifs-utils samba-client util-linux btrfs-progs smartmontools jq curl mergerfs
 #
 # 3. Configure Sudoers:
 #    The user running this script needs sudo NOPASSWD access for specific commands.
@@ -19,50 +35,67 @@
 #    a. Edit the sudoers file:
 #       sudo visudo
 #    b. Add the following line, replacing 'your_username' with the actual username running the script:
-#       your_username ALL=(ALL) NOPASSWD: /usr/sbin/zpool, /usr/sbin/zfs, /usr/sbin/smartctl, /usr/bin/journalctl, /usr/local/bin/mount_up.sh
+#       your_username ALL=(ALL) NOPASSWD: /sbin/btrfs, /usr/sbin/smartctl, /usr/bin/journalctl, /usr/local/bin/mount_up.sh
 #
-# 4. Set up individual ZFS Pools on your passed-through disks:
+# 4. Set up individual btrfs filesystems on your passed-through disks:
 #    (Example for /dev/sdb - replace with your actual disk devices)
-#    sudo zpool create -f pool_disk1 /dev/sdb
-#    sudo zpool create -f pool_disk2 /dev/sdc
+#    sudo mkfs.btrfs -L btrfs_disk1 /dev/sdb
+#    sudo mkfs.btrfs -L btrfs_disk2 /dev/sdc
 #    # ... repeat for all your individual disks ...
-#    (ZFS pools will typically auto-mount under /pool_disk1, /pool_disk2 etc.)
+#    # Create mount points for each btrfs filesystem
+#    sudo mkdir /btrfs_disk1 /btrfs_disk2 # These paths must match BTRFS_MOUNT_POINTS in backup_config.sh or .env
+#    # Mount them (or add to /etc/fstab for auto-mounting using LABELs is recommended)
+#    sudo mount /dev/sdb /btrfs_disk1
+#    sudo mount /dev/sdc /btrfs_disk2
+#    # Example /etc/fstab entries:
+#    # LABEL=btrfs_disk1 /btrfs_disk1 btrfs defaults 0 0
+#    # LABEL=btrfs_disk2 /btrfs_disk2 btrfs defaults 0 0
+#    # After fstab changes: sudo systemctl daemon-reload && sudo mount -a
+#    # Ensure a .snapshots directory exists in the root of each btrfs filesystem for snapshot storage
+#    # The snapshot_utils.sh script will attempt to create these if they don't exist.
+#    # sudo mkdir /btrfs_disk1/.snapshots /btrfs_disk2/.snapshots
 #
 # 5. Configure `mergerfs`:
 #    (mergerfs package should already be installed from step 2)
-#    Create a mount point for your merged pool:
+#    Create a mount point for your merged pool (must match DEST_ROOT in backup_config.sh or .env):
 #    sudo mkdir /mnt/merged_pool
-#    Edit /etc/fstab to configure mergerfs to mount at boot. This combines your ZFS pools.
+#    Edit /etc/fstab to configure mergerfs to mount at boot. This combines your btrfs filesystems.
 #    sudo nano /etc/fstab
-#    Add a line like this (adjust ZFS pool mount points and mergerfs options as needed):
-#    /pool_disk1:/pool_disk2:/pool_disk3 /mnt/merged_pool fuse.mergerfs defaults,allow_other,use_mfs,minfreespace=10G,fsname=mergerfs_pool 0 0
+#    Add a line like this (adjust btrfs filesystem mount points and mergerfs options as needed):
+#    /btrfs_disk1:/btrfs_disk2:/btrfs_disk3 /mnt/merged_pool fuse.mergerfs defaults,allow_other,use_mfs,minfreespace=10G,fsname=mergerfs_pool 0 0
 #    Save, exit, then mount: sudo mount -a
 #
-# 6. Place `backup.sh` (this script) and `mount_up.sh`:
-#    Assumes scripts are in /usr/local/bin for cron job.
-#    sudo cp backup.sh /usr/local/bin/backup.sh
-#    sudo cp mount_up.sh /usr/local/bin/mount_up.sh # Ensure mount_up.sh is present
-#    sudo chmod +x /usr/local/bin/backup.sh
+# 6. Place Scripts:
+#    Place `backup.sh` and all helper scripts (e.g., `backup_config.sh`, `logging_utils.sh`, etc.)
+#    in a directory like /usr/local/bin/backup_scripts/
+#    Place `mount_up.sh` in /usr/local/bin/ or ensure it's in the system PATH.
+#    sudo mkdir -p /usr/local/bin/backup_scripts
+#    sudo cp backup.sh backup_config.sh logging_utils.sh system_checks.sh rsync_operations.sh snapshot_utils.sh /usr/local/bin/backup_scripts/
+#    sudo cp mount_up.sh /usr/local/bin/mount_up.sh # Or your preferred location for mount_up.sh
+#    sudo chmod +x /usr/local/bin/backup_scripts/*.sh
 #    sudo chmod +x /usr/local/bin/mount_up.sh
 #
-# 7. Create .env Configuration File for `mount_up.sh` and `backup.sh`:
-#    This file stores sensitive details and configurations. Place it where `ENV_FILE` variable points.
-#    Default for `ENV_FILE` is same directory as script, e.g. /usr/local/bin/.env
-#    sudo nano /usr/local/bin/.env
+# 7. Create .env Configuration File:
+#    This file stores sensitive details and local overrides for `backup_config.sh`.
+#    Place it in the same directory as `backup.sh` (e.g., /usr/local/bin/backup_scripts/.env).
+#    sudo nano /usr/local/bin/backup_scripts/.env
 #    Add content like the example below, adjusting to your setup:
 #    ---
 #    MOUNT_BASE_DIR="/mnt/smb_shares"
 #    DEFAULT_MOUNT_OPTIONS="ro,iocharset=utf8,vers=3.0,uid=0,gid=0,forceuid,forcegid,file_mode=0644,dir_mode=0755"
 #    SERVER_IP="YOUR_NAS_IP_ADDRESS"
 #    SMB_USERNAME="your_smb_user"
-#    SMB_CREDENTIALS_PATH="/root/.smb_credentials_backup"
-#    # Optional: PUSHOVER_APP_TOKEN="your_app_token"
-#    # Optional: PUSHOVER_USER_KEY="your_user_key"
+#    SMB_CREDENTIALS_PATH="/root/.smb_credentials_backup" # Secure path for SMB credentials
+#    # Optional: Override Pushover tokens from backup_config.sh
+#    # PUSHOVER_APP_TOKEN="your_actual_app_token"
+#    # PUSHOVER_USER_KEY="your_actual_user_key"
+#    # Optional: Override BTRFS_MOUNT_POINTS, DEST_ROOT, etc.
+#    # BTRFS_MOUNT_POINTS="/mnt/mydisk1 /mnt/mydisk2"
 #    ---
-#    Set secure permissions: sudo chmod 600 /usr/local/bin/.env
+#    Set secure permissions: sudo chmod 600 /usr/local/bin/backup_scripts/.env
 #
 # 8. Create SMB Credentials File (referenced in .env by SMB_CREDENTIALS_PATH):
-#    Example path: /root/.smb_credentials_backup (must match SMB_CREDENTIALS_PATH in .env)
+#    Example path: /root/.smb_credentials_backup
 #    sudo nano /root/.smb_credentials_backup
 #    Add:
 #    ---
@@ -71,486 +104,107 @@
 #    ---
 #    Set secure permissions: sudo chmod 600 /root/.smb_credentials_backup
 #
-# 9. Configure `backup.sh` Variables:
-#    Review the "--- START CONFIGURATION ---" section in this script.
-#    Ensure `ENV_FILE` path is correct if you didn't place .env in /usr/local/bin.
-#    `PUSHOVER_APP_TOKEN` and `PUSHOVER_USER_KEY` can be set in script or in .env.
-#    `SOURCE_FOLDERS` is now dynamically determined and should not be set manually.
+# 9. Configure Variables:
+#    Review `backup_config.sh` for default settings.
+#    Override any necessary settings in the `.env` file as per step 7.
+#    `SOURCE_FOLDERS` is dynamically determined by this script and should not be set manually.
 #
 # 10. Schedule with Cron:
 #     Run as root or the user configured in sudoers (see step 3).
-#     sudo crontab -e
-#     Add (e.g., daily at 2 AM):
-#     0 2 * * * /usr/local/bin/backup.sh >> /var/log/backup_cron.log 2>&1
+#     Example: sudo crontab -e
+#     Add (e.g., daily at 2 AM, assuming scripts in /usr/local/bin/backup_scripts/):
+#     0 2 * * * /usr/local/bin/backup_scripts/backup.sh >> /var/log/backup_cron.log 2>&1
 #
 # --- END INSTALLATION INSTRUCTIONS ---
-#
-# --- SMB Mount Configuration (Handled by mount_up.sh) ---
-# The script will now call mount_up.sh to handle SMB mounts.
-# Ensure mount_up.sh is configured with a .env file in the same directory
-# (e.g. /usr/local/bin/.env) containing:
-#   MOUNT_BASE_DIR="/mnt/smb_mounts"
-#   DEFAULT_MOUNT_OPTIONS="vers=3.0,ro,iocharset=utf8,uid=0,gid=0,forceuid,forcegid,file_mode=0644,dir_mode=0755"
-#   SERVER_IP="YOUR_NAS_IP"
-#   SMB_USERNAME="smb_backup_user"
-#   SMB_CREDENTIALS_PATH="/root/.smbcredentials_backup" (or other secure path)
-#
-# The .smbcredentials_backup file should contain:
-#   username=smb_backup_user
-#   password=YOUR_SMB_PASSWORD
-# And have permissions 600.
-#
-# mount_up.sh will discover shares from SERVER_IP and mount them under MOUNT_BASE_DIR.
-# This script (backup.sh) will then dynamically find these mounts.
-# ---
 
-# --- START CONFIGURATION ---
+# --- Source Helper Scripts ---
+# SCRIPT_DIR will be the directory where backup.sh and its helper scripts are located.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
-# Path to the .env file. Assumes it's in the same directory as the script.
-# If this script is /usr/local/bin/backup.sh, then .env is /usr/local/bin/.env
-ENV_FILE="$(dirname "$0")/.env"
+# Source default configurations first. These can be overridden by .env.
+source "${SCRIPT_DIR}/backup_config.sh"
 
-# Pushover API Details (GET THESE FROM YOUR PUSHOVER APP)
-# These can also be moved to the .env file if preferred.
-PUSHOVER_APP_TOKEN="YOUR_PUSHOVER_APP_TOKEN" # Replace with your Pushover application token
-PUSHOVER_USER_KEY="YOUR_PUSHOVER_USER_KEY"   # Replace with your Pushover user key
+# Source utility functions from helper scripts.
+source "${SCRIPT_DIR}/logging_utils.sh"
+source "${SCRIPT_DIR}/system_checks.sh"
+source "${SCRIPT_DIR}/rsync_operations.sh"
+source "${SCRIPT_DIR}/snapshot_utils.sh"
 
-# Source (NAS) Mounted Shares Details
-# IMPORTANT: These paths will be dynamically determined after mount_up.sh runs.
-# This variable will be populated by the script.
+# --- Path to .env file ---
+# ENV_FILE path is relative to the script's location.
+ENV_FILE="${SCRIPT_DIR}/.env"
+
+# --- Dynamic & Global Variables ---
+# SOURCE_FOLDERS: Populated after mount_up.sh runs, listing mounted SMB shares.
 SOURCE_FOLDERS=""
-# Example of how it might look after mount_up.sh:
-# SOURCE_FOLDERS="/mnt/smb_mounts/YOUR_NAS_IP_media_movies/ /mnt/smb_mounts/YOUR_NAS_IP_media_tvshows/"
+# HOSTNAME_VAR: Current hostname, used in notifications. Exported for system_checks.sh.
+HOSTNAME_VAR=$(hostname)
+export HOSTNAME_VAR
 
-# Rsync Exclusion Filters (space-separated list of patterns to exclude within shares)
-# Rsync will ignore these files/folders globally within any synced share.
-# Note: The actual RSYNC_EXCLUDES array is defined further down and is the correct one.
-# This empty one below was causing a shellcheck parsing error.
-# RSYNC_EXCLUDES=(
+# --- Core Helper Functions (defined in backup.sh) ---
 
-
-# --- START CONFIGURATION ---
-
-# Pushover API Details (GET THESE FROM YOUR PUSHOVER APP)
-# IMPORTANT: Store these securely. If running via cron, consider adding them to
-# /etc/environment or your user's .profile/.bashrc, or source a separate config file.
-PUSHOVER_APP_TOKEN="YOUR_PUSHOVER_APP_TOKEN" # Replace with your Pushover application token
-PUSHOVER_USER_KEY="YOUR_PUSHOVER_USER_KEY"   # Replace with your Pushover user key
-
-# Example of how it might look after mount_up.sh:
-# SOURCE_FOLDERS="/mnt/smb_mounts/YOUR_NAS_IP_media_movies/ /mnt/smb_mounts/YOUR_NAS_IP_media_tvshows/"
-
-# Rsync Exclusion Filters (space-separated list of patterns to exclude within shares)
-# Rsync will ignore these files/folders globally within any synced share.
-RSYNC_EXCLUDES=(
-    "*.tmp"
-    "*.bak"
-    "@eaDir"        # Synology Thumbnail directory (common on NAS)
-    "#recycle"      # QNAP/Synology Recycle Bin (common on NAS)
-    ".Trash-*"      # Linux/macOS Trash folders
-    ".DS_Store"     # macOS desktop service store
-    "Thumbs.db"     # Windows thumbnail cache
-    "*.part"        # Partial download files
-    ".syncignore"   # SyncThing ignore files
-)
-
-# Destination (Debian VM) Details
-# This is the mount point of your mergerfs pool on destiation.
-DEST_ROOT="/mnt/merged_pool"
-# Optional: Subdirectory within DEST_ROOT where NAS backups will land.
-# This helps organize data on your destiation vm. E.g., /mnt/merged_pool/nas_backups/
-DEST_SUBDIR="nas_backups"
-FINAL_DEST="${DEST_ROOT}/${DEST_SUBDIR}"
-
-# ZFS Pool Names on destiation (space-separated list of your individual ZFS pool names)
-# IMPORTANT: These are the exact names you used with 'zpool create'.
-# Example: "pool_disk1 pool_disk2 pool_disk3 pool_disk4 pool_disk5"
-ZFS_POOLS="pool_disk1 pool_disk2 pool_disk3 pool_disk4 pool_disk5"
-
-# Snapshot Rotation Policy
-# Snapshots will be named like "backup@YYYY-MM-DD_HHMM"
-SNAPSHOT_PREFIX="backup"
-# Retention policy for snapshots per pool:
-# e.g., KEEP_DAILY=7 means keep the last 7 daily snapshots
-# Set to 0 to disable keeping that tier of snapshots.
-KEEP_DAILY=7
-KEEP_WEEKLY=4
-KEEP_MONTHLY=12
-KEEP_YEARLY=0
-
-# Script Logging
-LOG_FILE="/var/log/backup_pull.log" # Log file for this script's output
-
-# --- END CONFIGURATION ---
-
-
-# --- Helper Functions ---
-
-# Function to load environment variables from .env file
+# Loads variables from the .env file.
+# Variables in .env can override those set in backup_config.sh.
+# Ensures essential variables for script operation are present.
+# Globals:
+#   ENV_FILE: Path to the .env file.
+#   LOG_FILE: Path for logging (must be defined in backup_config.sh or .env).
+#   MOUNT_BASE_DIR, SERVER_IP: (from .env) checked for presence.
+# Returns:
+#   0 if .env loaded successfully (or not found but optional) and essentials are present.
+#   1 if .env is required but not found, or essential variables are missing.
 load_env() {
-    echo "$(date) INFO: Loading environment variables from ${ENV_FILE}..." | tee -a "$LOG_FILE"
+    echo "$(date) INFO: Attempting to load environment variables from ${ENV_FILE}..." | tee -a "$LOG_FILE"
     if [[ ! -f "${ENV_FILE}" ]]; then
-        echo "$(date) ERROR: .env file '${ENV_FILE}' not found." | tee -a "$LOG_FILE"
-        # Attempt to find .env in /usr/local/bin as a fallback for cronjob execution
-        if [[ -f "/usr/local/bin/.env" ]]; then
-            ENV_FILE="/usr/local/bin/.env"
-            echo "$(date) INFO: Found .env file at ${ENV_FILE}" | tee -a "$LOG_FILE"
-        else
-            echo "$(date) ERROR: .env file also not found in /usr/local/bin/. Exiting." | tee -a "$LOG_FILE"
-            # exit 1 # Exiting can be problematic for shellcheck in some contexts; error message should suffice.
-            return 1 # Indicate failure
-        fi
-    fi
-
-    local env_permissions
-    env_permissions=$(stat -c "%a" "${ENV_FILE}")
-    # SC2155: Declare and assign separately. Applied.
-    # The original if had a syntax error: if [[ "$env_permissions" != "600" ]]; {
-    # Corrected to:
-    if [[ "$env_permissions" != "600" ]]; then
-        # In a cron job, this might be too strict if script dir is not user-owned.
-        # For now, we'll warn but not exit, as critical creds are in SMB_CREDENTIALS_PATH
-        echo "$(date) WARNING: .env file '${ENV_FILE}' has insecure permissions (${env_permissions}). Recommended: 600." | tee -a "$LOG_FILE"
-    fi
-
-    set -a # Automatically export all variables after this point
-    # shellcheck source=./.env
-    source "${ENV_FILE}"
-    set +a # Stop automatically exporting variables
-
-    # Verify essential variables for backup.sh (some are for mount_up.sh, loaded there)
-    if [[ -z "${MOUNT_BASE_DIR}" || -z "${SERVER_IP}" ]]; then
-        echo "$(date) ERROR: Missing one or more required variables in ${ENV_FILE} for backup.sh:" | tee -a "$LOG_FILE"
-        echo "         MOUNT_BASE_DIR, SERVER_IP." | tee -a "$LOG_FILE"
-        echo "         Please check your .env file." | tee -a "$LOG_FILE"
-        # exit 1 # Exiting can be problematic.
-        return 1 # Indicate failure
-    fi
-    echo "$(date) INFO: Environment variables loaded." | tee -a "$LOG_FILE"
-    return 0 # Indicate success
-}
-
-
-# Function to send Pushover notification
-pushover_notify() {
-    local title="$1"
-    local message="$2"
-    local priority="${3:-0}" # Default priority 0 (normal)
-    local url="https://api.pushover.net/1/messages.json"
-
-    if [[ -z "$PUSHOVER_APP_TOKEN" || -z "$PUSHOVER_USER_KEY" ]]; then
-        echo "$(date) ERROR: Pushover API tokens not set. Cannot send notification." | tee -a "$LOG_FILE"
-        return 1
-    fi
-
-    curl -s \
-        -F "token=$PUSHOVER_APP_TOKEN" \
-        -F "user=$PUSHOVER_USER_KEY" \
-        -F "title=$title" \
-        -F "message=$message" \
-        -F "priority=$priority" \
-        "$url" > /dev/null
-
-    if [[ $? -ne 0 ]]; then
-        echo "$(date) ERROR: Failed to send Pushover notification." | tee -a "$LOG_FILE"
-        return 1
-    fi
-}
-
-# Function to check system and ZFS logs for errors
-check_logs() {
-    echo "$(date) INFO: Checking system and ZFS logs for errors..." | tee -a "$LOG_FILE"
-    local error_found=0
-    local message="" # Start message empty
-    local hostname_cmd
-    hostname_cmd=$(hostname) # Capture hostname once
-
-    local check_period="24 hours ago" # How far back to check logs
-
-    # Check dmesg for recent critical errors
-    local dmesg_errors
-    dmesg_errors=$(journalctl -k --since "$check_period" | grep -E "error|fail|critical" | grep -Ev "error_report|failed to stat" | head -n 5)
-    if [[ -n "$dmesg_errors" ]]; then
-        message+="Critical kernel errors found in dmesg. "
-        error_found=1
-    fi
-
-    # Check ZFS pool status for errors
-    local zfs_status_output
-    zfs_status_output=$(sudo zpool status -x)
-    if [[ -n "$zfs_status_output" ]]; then
-        if echo "$zfs_status_output" | grep -Eq "DEGRADED|FAULTED|OFFLINE|UNAVAIL|REMOVED|corrupt|checksum"; then
-            message+="ZFS pool errors found! Status: $(zpool status -x | head -n 3). "
-            error_found=1
-        fi
-    fi
-
-    # Check SMART status of all disks
-    local smart_errors_detected=0
-    for pool in $ZFS_POOLS; do
-        # Get list of underlying devices for the ZFS pool
-        local pool_devices
-        pool_devices=$(sudo zpool status "$pool" | grep -E "sd[a-z]|nvme[0-9]" | awk '{print $1}')
-        for device in $pool_devices; do
-            local disk_path="/dev/$device"
-            if [[ ! -e "$disk_path" ]]; then
-                echo "$(date) WARNING: Disk path $disk_path not found for SMART check. Skipping." | tee -a "$LOG_FILE"
-                continue
-            fi
-
-            local smart_health
-            smart_health=$(sudo smartctl -H "$disk_path" | grep "SMART overall-health self-assessment test result:")
-            if [[ "$smart_health" == *"FAILED"* ]]; then
-                message+="SMART error on $disk_path ($pool)! "
-                smart_errors_detected=1
-            fi
-        done
-    done
-    if [[ $smart_errors_detected -eq 1 ]]; then
-        error_found=1
-    fi
-
-    if [[ $error_found -eq 1 ]]; then
-        echo "$(date) ERROR: Log check found issues. Notifying Pushover." | tee -a "$LOG_FILE"
-        pushover_notify "$hostname_cmd Backup Status: ALERT!" "$message" 1 # High priority
-        return 1 # Indicate error
+        echo "$(date) INFO: .env file '${ENV_FILE}' not found. Using defaults from backup_config.sh and script." | tee -a "$LOG_FILE"
+        # If .env is strictly required, one might exit here. For now, it's optional.
     else
-        echo "$(date) INFO: Log check completed. No critical errors found." | tee -a "$LOG_FILE"
-        return 0 # Indicate success
-    fi
-}
-
-# Function to perform rsync backup
-perform_rsync() {
-    echo "$(date) INFO: Starting rsync backup from NAS SMB shares..." | tee -a "$LOG_FILE"
-    local rsync_failed=0
-
-    # Ensure destination subdirectory exists
-    mkdir -p "$FINAL_DEST"
-
-    # Build rsync exclude arguments
-    local rsync_exclude_args=""
-    for exclude_pattern in "${RSYNC_EXCLUDES[@]}"; do
-        rsync_exclude_args+="--exclude='${exclude_pattern}' "
-    done
-
-    # Iterate through each source folder (which are now mounted SMB shares)
-    if [[ -z "$SOURCE_FOLDERS" ]]; then
-        echo "$(date) ERROR: No source folders specified in configuration. Rsync skipped." | tee -a "$LOG_FILE"
-        return 1
-    fi
-
-    for src_folder_path in $SOURCE_FOLDERS; do
-        # mount_up.sh should have already mounted these.
-        # We still check if it's a valid directory, as a basic sanity check.
-        if [[ ! -d "$src_folder_path" ]]; then
-            echo "$(date) ERROR: Source directory '$src_folder_path' does not exist or is not a directory. Skipping." | tee -a "$LOG_FILE"
-            rsync_failed=1
-            continue
+        local env_permissions
+        env_permissions=$(stat -c "%a" "${ENV_FILE}")
+        if [[ "$env_permissions" != "600" ]]; then
+            echo "$(date) WARNING: .env file '${ENV_FILE}' has insecure permissions (${env_permissions}). Recommended: 600." | tee -a "$LOG_FILE"
         fi
 
-        # The share name is derived from the directory name created by mount_up.sh
-        # e.g., /mnt/smb_mounts/192_168_1_10_media_movies -> 192_168_1_10_media_movies
-        local mounted_share_basename
-        mounted_share_basename=$(basename "${src_folder_path%/}")
-        # We want to store it in DEST_SUBDIR like 'media_movies', not '192_168_1_10_media_movies'
-        # We need to strip the SERVER_IP prefix that mount_up.sh adds.
-        local server_ip_prefix="${SERVER_IP//./_}_"
-        local original_share_name="${mounted_share_basename#"$server_ip_prefix"}" # SC2295 fix: Added quotes
-
-        if [[ -z "$original_share_name" ]]; then # Safety check if stripping failed
-            original_share_name="$mounted_share_basename" # Fallback to full name
-            echo "$(date) WARNING: Could not strip SERVER_IP prefix from '$mounted_share_basename'. Using full name for destination." | tee -a "$LOG_FILE"
-        fi
-
-        local dest_path="${FINAL_DEST}/${original_share_name}/" # Backup each share into its own subdirectory
-
-        echo "$(date) INFO: Syncing '$original_share_name' from '$src_folder_path' to '$dest_path'" | tee -a "$LOG_FILE" # SC2154 fix: Used original_share_name
-        mkdir -p "$dest_path" # Ensure destination for this specific share exists
-
-        # rsync command for SMB mounted shares
-        # -a: archive mode (preserves permissions, timestamps, owner, group, symlinks etc. -- as much as SMB allows)
-        # -v: verbose
-        # -h: human-readable numbers
-        # --delete: deletes files on destination that no longer exist on source
-        # --progress: show progress during transfer
-        # --no-whole-file: (Crucial for delta transfers over network mounts) Forces rsync to use its delta algorithm.
-        #                  Without this, it might download entire files if destination is on a local mount.
-        rsync_command="rsync -avh --delete --progress --no-whole-file ${rsync_exclude_args} \"${src_folder_path}\" \"${dest_path}\""
-        echo "$(date) DEBUG: Running command: $rsync_command" | tee -a "$LOG_FILE"
-
-        if ! eval "$rsync_command" 2>&1 | tee -a "$LOG_FILE"; then # SC2181 fix for eval
-            echo "$(date) ERROR: Rsync failed for share '$original_share_name'. Check log for details." | tee -a "$LOG_FILE" # SC2154 fix (already applied but verify)
-            rsync_failed=1 # Mark as failed for this share
-            # Do NOT break here, try to backup other shares even if one fails
-        fi
-    done
-
-    if [[ "$rsync_failed" -eq 0 ]]; then
-        echo "$(date) INFO: Rsync backup completed successfully for all shares." | tee -a "$LOG_FILE"
-        return 0
-    else
-        echo "$(date) ERROR: One or more Rsync backups failed for shares. Check log for details." | tee -a "$LOG_FILE"
-        return 1
+        # Source the .env file. `set -a` exports all variables defined within it.
+        set -a
+        # shellcheck source=./.env # Path is dynamic, shellcheck may not find it.
+        source "${ENV_FILE}"
+        set +a
+        echo "$(date) INFO: Successfully loaded variables from ${ENV_FILE}." | tee -a "$LOG_FILE"
     fi
-}
 
-# Function to take snapshots of individual ZFS pools
-take_snapshots() {
-    echo "$(date) INFO: Starting ZFS snapshot process..." | tee -a "$LOG_FILE"
-    local snapshot_timestamp
-    snapshot_timestamp=$(date +%Y-%m-%d_%H%M)
-    local snapshot_name="${SNAPSHOT_PREFIX}@${snapshot_timestamp}"
-    local snapshot_failed=0
-
-    for pool in $ZFS_POOLS; do
-        echo "$(date) INFO: Taking snapshot of ZFS pool '$pool'..." | tee -a "$LOG_FILE"
-        # We snapshot the root dataset of each ZFS pool, as mergerfs distributes files across them.
-        if ! sudo zfs snapshot "${pool}@${snapshot_name}" 2>&1 | tee -a "$LOG_FILE"; then # SC2181 fix
-            echo "$(date) ERROR: Failed to take snapshot for pool '$pool'. Check log for details." | tee -a "$LOG_FILE"
-            snapshot_failed=1
-        fi
-    done
-
-    if [[ $snapshot_failed -eq 0 ]]; then
-        echo "$(date) INFO: ZFS snapshots completed successfully." | tee -a "$LOG_FILE"
-        return 0
-    else
-        echo "$(date) ERROR: One or more ZFS snapshots failed. Check log for details." | tee -a "$LOG_FILE"
-        return 1
+    # Verify essential variables are now set (either from backup_config.sh or .env).
+    if [[ -z "${MOUNT_BASE_DIR}" || -z "${SERVER_IP}" || -z "${LOG_FILE}" ]]; then
+        echo "$(date) ERROR: Essential variables (MOUNT_BASE_DIR, SERVER_IP, LOG_FILE) are missing after checking backup_config.sh and .env. Script cannot continue." | tee -a "${LOG_FILE:-/tmp/backup_early_error.log}"
+        return 1 # Indicate critical failure.
     fi
+
+    # Re-derive FINAL_DEST in case DEST_ROOT or DEST_SUBDIR were overridden by .env
+    FINAL_DEST="${DEST_ROOT}/${DEST_SUBDIR}"
+
+    echo "$(date) INFO: Environment variables initialized. LOG_FILE is $LOG_FILE." | tee -a "$LOG_FILE"
+    return 0
 }
-
-# Function for ZFS snapshot rotation
-rotate_snapshots() {
-    echo "$(date) INFO: Starting ZFS snapshot rotation process..." | tee -a "$LOG_FILE"
-    local rotation_failed=0
-
-    for pool in $ZFS_POOLS; do
-        echo "$(date) INFO: Rotating snapshots for ZFS pool '$pool' based on retention policy." | tee -a "$LOG_FILE"
-        # Get list of snapshots for this pool with our prefix, sorted by creation date
-        local snapshots_list
-        snapshots_list=$(sudo zfs list -t snapshot -o name,creation -s creation -r "${pool}" | grep "${pool}@${SNAPSHOT_PREFIX}" | awk '{print $1}')
-
-        local keep_daily_count=0
-        local keep_weekly_count=0
-        local keep_monthly_count=0
-        local keep_yearly_count=0
-
-        for snapshot in $snapshots_list; do
-            local creation_epoch
-            creation_epoch=$(sudo zfs get -Hp creation "$snapshot" | awk '{print $2}') # epoch time
-            local current_epoch
-            current_epoch=$(date +%s)
-            local age_seconds=$((current_epoch - creation_epoch))
-            local age_days=$((age_seconds / (60*60*24)))
-
-            local keep_this_snapshot=0
-
-            # Keep daily snapshots (most recent)
-            if [[ "$age_days" -lt 7 && "$keep_daily_count" -lt "$KEEP_DAILY" ]]; then
-                keep_this_snapshot=1; keep_daily_count=$((keep_daily_count+1))
-            fi
-
-            # Keep weekly snapshots (1 per week, after daily limit)
-            # This is a simplified approximation for "first of the week" (or "oldest in week")
-            if [[ "$age_days" -ge 7 && "$keep_weekly_count" -lt "$KEEP_WEEKLY" ]]; then
-                # local week_num=$((age_days / 7)) # SC2034: week_num appears unused.
-                local found_later_in_week=0
-                # Check if there's any snapshot created later in the same week that we're keeping
-                for later_snapshot in $snapshots_list; do
-                    if [[ "$later_snapshot" == "$snapshot" ]]; then continue; fi # Skip self
-                    local later_creation_epoch
-                    later_creation_epoch=$(sudo zfs get -Hp creation "$later_snapshot" | awk '{print $2}')
-                    local later_age_days=$(((current_epoch - later_creation_epoch) / (60*60*24)))
-                    if [[ "$later_age_days" -lt "$age_days" && "$later_age_days" -ge $((age_days - 7)) ]]; then
-                        found_later_in_week=1; break;
-                    fi
-                done
-                if [[ "$found_later_in_week" -eq 0 ]]; then
-                    keep_this_snapshot=1; keep_weekly_count=$((keep_weekly_count+1))
-                fi
-            fi
-
-            # Keep monthly snapshots (1 per month, after weekly limit)
-            # Find the oldest snapshot within each month range (roughly)
-            if [[ "$age_days" -ge 30 && "$keep_monthly_count" -lt "$KEEP_MONTHLY" ]]; then
-                # local month_num=$((age_days / 30)) # SC2034: month_num appears unused.
-                local found_later_in_month=0
-                for later_snapshot in $snapshots_list; do
-                    if [[ "$later_snapshot" == "$snapshot" ]]; then continue; fi
-                    local later_creation_epoch
-                    later_creation_epoch=$(sudo zfs get -Hp creation "$later_snapshot" | awk '{print $2}')
-                    local later_age_days=$(((current_epoch - later_creation_epoch) / (60*60*24)))
-                    if [[ "$later_age_days" -lt "$age_days" && "$later_age_days" -ge $((age_days - 30)) ]]; then
-                        found_later_in_month=1; break;
-                    fi
-                done
-                if [[ "$found_later_in_month" -eq 0 ]]; then
-                    keep_this_snapshot=1; keep_monthly_count=$((keep_monthly_count+1))
-                fi
-            fi
-
-            # Keep yearly snapshots
-            if [[ "$age_days" -ge 365 && "$keep_yearly_count" -lt "$KEEP_YEARLY" ]]; then
-                # local year_num=$((age_days / 365)) # SC2034: year_num appears unused.
-                local found_later_in_year=0
-                for later_snapshot in $snapshots_list; do
-                    if [[ "$later_snapshot" == "$snapshot" ]]; then break; fi
-                    local later_creation_epoch
-                    later_creation_epoch=$(sudo zfs get -Hp creation "$later_snapshot" | awk '{print $2}')
-                    local later_age_days=$(((current_epoch - later_creation_epoch) / (60*60*24)))
-                    if [[ "$later_age_days" -lt "$age_days" && "$later_age_days" -ge $((age_days - 365)) ]]; then
-                        found_later_in_year=1; break;
-                    fi
-                done
-                if [[ "$found_later_in_year" -eq 0 ]]; then
-                    keep_this_snapshot=1; keep_yearly_count=$((keep_yearly_count+1))
-                fi
-            fi
-
-            # If not explicitly marked to keep by any policy, delete it
-            if [[ "$keep_this_snapshot" -eq 0 ]]; then
-                echo "$(date) INFO: Deleting old snapshot: $snapshot (Age: ${age_days} days)" | tee -a "$LOG_FILE"
-                if ! sudo zfs destroy "$snapshot" 2>&1 | tee -a "$LOG_FILE"; then # SC2181 fix
-                    echo "$(date) ERROR: Failed to delete snapshot '$snapshot' for pool '$pool'. Check log." | tee -a "$LOG_FILE"
-                    rotation_failed=1
-                fi
-            else
-                echo "$(date) INFO: Keeping snapshot: $snapshot (Age: ${age_days} days)" | tee -a "$LOG_FILE"
-            fi
-        done
-    done
-
-    if [[ "$rotation_failed" -eq 0 ]]; then
-        echo "$(date) INFO: Snapshot rotation completed successfully." | tee -a "$LOG_FILE"
-        return 0
-    else
-        echo "$(date) ERROR: One or more snapshot rotations failed. Check log for details." | tee -a "$LOG_FILE"
-        return 1
-    fi
-}
-
 
 # --- Main Script Execution Logic ---
 
+# Record start time for duration calculation.
 START_TIME=$(date +%s)
-HOSTNAME_VAR=$(hostname) # Use a different variable name to avoid conflict with `hostname` command or function
+# Initialize script status. This will be updated based on outcomes of operations.
 SCRIPT_STATUS="SUCCESS"
-MOUNT_UP_SCRIPT="/usr/local/bin/mount_up.sh" # Path to mount_up.sh
+# Path to the mount_up.sh script.
+MOUNT_UP_SCRIPT="/usr/local/bin/mount_up.sh" # Adjust if mount_up.sh is elsewhere.
 
-# Cleanup function to be called on exit
+# Cleanup function to unmount shares on script exit (normal or error).
+# Triggered by EXIT, TERM, INT signals.
 cleanup_mounts() {
-    echo "$(date) INFO: Running cleanup task: unmounting shares via mount_up.sh..." | tee -a "$LOG_FILE"
-    # This will call mount_up.sh, which first unmounts all existing managed shares.
-    # For a strict unmount-only, mount_up.sh would need an argument.
-    # For now, this ensures they are unmounted before script exits, even if it then tries to remount.
+    echo "$(date) INFO: Running cleanup task: attempting to unmount shares via mount_up.sh..." | tee -a "$LOG_FILE"
     if [[ -x "$MOUNT_UP_SCRIPT" ]]; then
-        # Ideally, mount_up.sh should have an --unmount-only flag.
-        # Calling it as is will unmount then attempt to remount.
-        # This is acceptable for now as it achieves unmounting.
-        if ! sudo "$MOUNT_UP_SCRIPT" --unmount-only >> "$LOG_FILE" 2>&1; then # SC2181 fix
-            echo "$(date) WARNING: mount_up.sh (for unmounting) exited with an error during cleanup." | tee -a "$LOG_FILE"
+        # Call mount_up.sh with --unmount-only flag (assuming mount_up.sh supports this).
+        # If mount_up.sh doesn't support --unmount-only, it might try to remount,
+        # which is generally acceptable for cleanup as it ensures unmounting first.
+        if ! sudo "$MOUNT_UP_SCRIPT" --unmount-only >> "$LOG_FILE" 2>&1; then
+            echo "$(date) WARNING: mount_up.sh (for unmounting) exited with an error during cleanup. Check logs." | tee -a "$LOG_FILE"
         else
             echo "$(date) INFO: mount_up.sh (for unmounting) completed during cleanup." | tee -a "$LOG_FILE"
         fi
@@ -558,134 +212,146 @@ cleanup_mounts() {
         echo "$(date) WARNING: $MOUNT_UP_SCRIPT not found or not executable. Cannot unmount shares automatically." | tee -a "$LOG_FILE"
     fi
 }
-
-# Set trap to run cleanup_mounts on EXIT, TERM, INT
 trap cleanup_mounts EXIT TERM INT
 
+# --- Backup Process Start ---
 echo "--- $(date) Starting Backup Job on $HOSTNAME_VAR ---" | tee -a "$LOG_FILE"
 
-# Load environment variables from .env file
-if ! load_env; then # SC2181 fix (applied to function call)
-    SCRIPT_STATUS="FAILURE"
-    NOTIFICATION_TITLE="$HOSTNAME_VAR Backup Status: CRITICAL!"
-    NOTIFICATION_MESSAGE="Failed to load .env file or essential variables. Backup script cannot continue. Check $LOG_FILE."
-    NOTIFICATION_PRIORITY=2 # Highest priority
-    # Attempt to send Pushover notification if tokens are available (might not be if .env failed)
+# Step 1: Load environment variables from .env, potentially overriding defaults from backup_config.sh.
+# This must happen before any operation that relies on these variables, especially LOG_FILE.
+if ! load_env; then
+    SCRIPT_STATUS="FAILURE" # load_env already logged critical error.
+    # Attempt to send a Pushover notification if PUSHOVER tokens were somehow set before load_env failed for other reasons.
     # This is a best-effort notification for critical failure.
-    pushover_notify "$NOTIFICATION_TITLE" "$NOTIFICATION_MESSAGE" "$NOTIFICATION_PRIORITY"
-    echo "$(date) CRITICAL: .env loading failed. Exiting." | tee -a "$LOG_FILE"
-    exit 1 # Critical failure, cannot proceed
+    if [[ -n "$PUSHOVER_APP_TOKEN" && -n "$PUSHOVER_USER_KEY" ]]; then
+         pushover_notify "$HOSTNAME_VAR Backup Status: CRITICAL FAILURE!" "Failed to load .env file or essential variables. Backup script cannot continue. Check ${LOG_FILE:-/tmp/backup_early_error.log}." 2
+    fi
+    echo "$(date) CRITICAL: Environment loading failed. Exiting." | tee -a "${LOG_FILE:-/tmp/backup_early_error.log}"
+    exit 1 # Critical failure, cannot proceed.
 fi
 
-# Step 0: Check logs and notify (High priority if errors found)
-if ! check_logs; then
-    SCRIPT_STATUS="FAILURE" # Set status but continue to try and unmount shares if any were mounted
-    NOTIFICATION_TITLE="$HOSTNAME_VAR Backup Status: ALERT!"
-    NOTIFICATION_MESSAGE="Log check found errors before backup. Check logs on $HOSTNAME_VAR."
-    NOTIFICATION_PRIORITY=1 # High priority
-    # Notification will be sent at the end.
+# Step 2: Check system logs and hardware health before starting backup operations.
+if ! check_logs; then # check_logs sends its own notification on failure.
+    SCRIPT_STATUS="FAILURE" # Mark script as failed but continue to attempt other steps like unmounting.
+    NOTIFICATION_TITLE="$HOSTNAME_VAR Backup Status: SYSTEM ALERT before Backup"
+    NOTIFICATION_MESSAGE="System health check found errors before backup operations started. Backup attempt will continue if possible, but check logs on $HOSTNAME_VAR."
+    NOTIFICATION_PRIORITY=1
+    # Note: A comprehensive notification will be sent at the end. This just sets the stage.
 fi
 
-# Step 1: Mount SMB shares using mount_up.sh
+# Step 3: Mount SMB shares using mount_up.sh. Only proceed if previous steps were successful enough.
 if [[ "$SCRIPT_STATUS" == "SUCCESS" ]]; then
     echo "$(date) INFO: Calling mount_up.sh to mount SMB shares..." | tee -a "$LOG_FILE"
     if [[ -x "$MOUNT_UP_SCRIPT" ]]; then
-        if ! sudo "$MOUNT_UP_SCRIPT" >> "$LOG_FILE" 2>&1; then # SC2181 fix
+        # mount_up.sh should handle its own logging. Output is also captured here.
+        if ! sudo "$MOUNT_UP_SCRIPT" >> "$LOG_FILE" 2>&1; then
             SCRIPT_STATUS="FAILURE"
-            NOTIFICATION_TITLE="$HOSTNAME_VAR Backup Status: FAILED!"
-            NOTIFICATION_MESSAGE="mount_up.sh script failed to mount shares. Check $LOG_FILE and mount_up.sh logs."
+            NOTIFICATION_TITLE="$HOSTNAME_VAR Backup Status: MOUNT FAILED!"
+            NOTIFICATION_MESSAGE="mount_up.sh script failed to mount SMB shares. Check $LOG_FILE and mount_up.sh logs for details."
             NOTIFICATION_PRIORITY=1
-            echo "$(date) ERROR: $MOUNT_UP_SCRIPT failed." | tee -a "$LOG_FILE"
+            echo "$(date) ERROR: $MOUNT_UP_SCRIPT failed to mount shares." | tee -a "$LOG_FILE"
         else
-            echo "$(date) INFO: mount_up.sh completed successfully." | tee -a "$LOG_FILE"
-            # Dynamically determine SOURCE_FOLDERS
-            # mount_up.sh creates directories like /MOUNT_BASE_DIR/SERVER_IP_sharename
-            # We need to find these and add a trailing slash for rsync
-            formatted_server_ip="${SERVER_IP//./_}" # e.g., 192.168.1.10 -> 192_168_1_10
+            echo "$(date) INFO: mount_up.sh completed successfully. Discovering mounted shares..." | tee -a "$LOG_FILE"
+            # Dynamically determine SOURCE_FOLDERS from mounted shares.
+            # Assumes mount_up.sh creates directories like /MOUNT_BASE_DIR/SERVER_IP_sharename/
+            local formatted_server_ip="${SERVER_IP//./_}" # Convert SERVER_IP to filesystem-safe format.
 
-            # Ensure MOUNT_BASE_DIR does not have a trailing slash for robust find operation
-            # Then use find to get all directories matching the pattern, and append a slash
+            # Find directories matching the pattern and append a trailing slash for rsync.
+            # Ensure MOUNT_BASE_DIR does not have a trailing slash for robust find.
             SOURCE_FOLDERS=$(find "${MOUNT_BASE_DIR%/}" -maxdepth 1 -type d -name "${formatted_server_ip}_*" -print0 | xargs -0 -I {} echo "{}/")
 
             if [[ -z "$SOURCE_FOLDERS" ]]; then
                 SCRIPT_STATUS="FAILURE"
-                NOTIFICATION_TITLE="$HOSTNAME_VAR Backup Status: FAILED!"
-                NOTIFICATION_MESSAGE="mount_up.sh ran, but no source folders found under ${MOUNT_BASE_DIR} for server ${SERVER_IP}."
-                NOTIFICATION_PRIORITY=1
-                echo "$(date) ERROR: No source folders found after running mount_up.sh. Check MOUNT_BASE_DIR and mount_up.sh logs." | tee -a "$LOG_FILE"
+                NOTIFICATION_TITLE="$HOSTNAME_VAR Backup Status: MOUNT WARNING!"
+                NOTIFICATION_MESSAGE="mount_up.sh ran, but no source folders (SMB shares) were found under ${MOUNT_BASE_DIR} for server ${SERVER_IP}. Rsync will be skipped."
+                NOTIFICATION_PRIORITY=1 # Treat as failure if no sources found.
+                echo "$(date) ERROR: No source folders found after running mount_up.sh. Check MOUNT_BASE_DIR ('$MOUNT_BASE_DIR') and mount_up.sh logs." | tee -a "$LOG_FILE"
             else
-                echo "$(date) INFO: Dynamically determined SOURCE_FOLDERS: ${SOURCE_FOLDERS}" | tee -a "$LOG_FILE"
+                echo "$(date) INFO: Dynamically determined SOURCE_FOLDERS for rsync: ${SOURCE_FOLDERS}" | tee -a "$LOG_FILE"
             fi
         fi
     else
         SCRIPT_STATUS="FAILURE"
-        NOTIFICATION_TITLE="$HOSTNAME_VAR Backup Status: FAILED!"
-        NOTIFICATION_MESSAGE="$MOUNT_UP_SCRIPT not found or not executable. Cannot mount shares."
+        NOTIFICATION_TITLE="$HOSTNAME_VAR Backup Status: SCRIPT MISSING!"
+        NOTIFICATION_MESSAGE="$MOUNT_UP_SCRIPT not found or not executable at '$MOUNT_UP_SCRIPT'. Cannot mount SMB shares."
         NOTIFICATION_PRIORITY=1
         echo "$(date) ERROR: $MOUNT_UP_SCRIPT not found or not executable." | tee -a "$LOG_FILE"
     fi
 fi
 
-# Step 2: Perform rsync backup
-if [[ "$SCRIPT_STATUS" == "SUCCESS" ]]; then # Only if mounts were successful
-    if ! perform_rsync; then
-        SCRIPT_STATUS="FAILURE"
-        NOTIFICATION_TITLE="$HOSTNAME_VAR Backup Status: FAILED!"
-        NOTIFICATION_MESSAGE="Rsync failed. Check logs on $HOSTNAME_VAR."
-        NOTIFICATION_PRIORITY=1
-        # Pushover notification will be handled at the end
-    fi
-fi
-
-# Only proceed with snapshots if rsync was successful
+# Step 4: Perform rsync backup. Only if mounts were (or seemed) successful.
 if [[ "$SCRIPT_STATUS" == "SUCCESS" ]]; then
-    # Step 3: Take snapshots
-    if ! take_snapshots; then
+    if ! perform_rsync; then # perform_rsync logs its own errors.
         SCRIPT_STATUS="FAILURE"
-        # Update notification vars, but send at the end
-        NOTIFICATION_TITLE="$HOSTNAME_VAR Backup Status: FAILED!"
-        NOTIFICATION_MESSAGE="Snapshot creation failed. Check logs on $HOSTNAME_VAR."
+        NOTIFICATION_TITLE="$HOSTNAME_VAR Backup Status: RSYNC FAILED!"
+        NOTIFICATION_MESSAGE="Rsync operation failed during backup. Check logs on $HOSTNAME_VAR for details of failed shares."
         NOTIFICATION_PRIORITY=1
     fi
 fi
 
-# Always attempt rotation if ZFS_POOLS is set and script hasn't critically failed before this point
-if [[ "$SCRIPT_STATUS" != "CRITICAL_ERROR_PREVENTING_ROTATION" && -n "$ZFS_POOLS" ]]; then
-    # Step 4: Rotate snapshots
-    if ! rotate_snapshots; then
-        if [[ "$SCRIPT_STATUS" == "SUCCESS" ]]; then # If backup was successful but rotation failed
-            SCRIPT_STATUS="WARNING"
-            NOTIFICATION_TITLE="$HOSTNAME_VAR Backup Status: WARNING!"
-            NOTIFICATION_MESSAGE="Backup successful, but snapshot rotation failed. Check logs on $HOSTNAME_VAR."
-            NOTIFICATION_PRIORITY=0
-        elif [[ "$SCRIPT_STATUS" == "FAILURE" ]]; then # If backup already failed, add to existing error message
-            NOTIFICATION_MESSAGE+=" Snapshot rotation also failed."
-            # Keep priority 1 if already a failure
-        fi
-        # If SCRIPT_STATUS was ALERT from log check, this warning will override it if logs were the only issue.
-        # This is acceptable as rotation failure is a significant warning.
+# Step 5: Take btrfs snapshots. Only if rsync was successful.
+if [[ "$SCRIPT_STATUS" == "SUCCESS" ]]; then
+    if ! take_snapshots; then # take_snapshots logs its own errors.
+        SCRIPT_STATUS="FAILURE"
+        NOTIFICATION_TITLE="$HOSTNAME_VAR Backup Status: SNAPSHOT FAILED!"
+        NOTIFICATION_MESSAGE="btrfs snapshot creation failed after rsync. Check logs on $HOSTNAME_VAR."
+        NOTIFICATION_PRIORITY=1
     fi
 fi
 
+# Step 6: Rotate btrfs snapshots.
+# This runs even if the backup part (rsync/snapshot) failed, to ensure old snapshots are still pruned.
+# However, it doesn't run if there was a critical configuration error earlier.
+if [[ "$SCRIPT_STATUS" != "CRITICAL_ERROR_PREVENTING_ROTATION" && -n "$BTRFS_MOUNT_POINTS" ]]; then # Check BTRFS_MOUNT_POINTS exists
+    if ! rotate_snapshots; then # rotate_snapshots logs its own errors.
+        # If backup was successful but only rotation failed, it's a warning.
+        if [[ "$SCRIPT_STATUS" == "SUCCESS" ]]; then
+            SCRIPT_STATUS="WARNING"
+            NOTIFICATION_TITLE="$HOSTNAME_VAR Backup Status: ROTATION WARNING!"
+            NOTIFICATION_MESSAGE="Backup (rsync and snapshot creation) was successful, but snapshot rotation failed. Check logs on $HOSTNAME_VAR."
+            NOTIFICATION_PRIORITY=0 # Normal priority for rotation warning if backup itself was fine.
+        elif [[ "$SCRIPT_STATUS" == "FAILURE" ]]; then
+            # If backup already failed, append to the existing failure message.
+            NOTIFICATION_MESSAGE+=" Additionally, snapshot rotation also failed."
+            # Keep high priority from the earlier failure.
+        fi
+    fi
+else
+    if [[ -z "$BTRFS_MOUNT_POINTS" ]]; then
+         echo "$(date) INFO: BTRFS_MOUNT_POINTS is not set or empty. Skipping snapshot rotation." | tee -a "$LOG_FILE"
+    fi
+fi
+
+# --- Final Reporting ---
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
 
-# Step 5: Notify final status via Pushover
-# Consolidate notification sending to here.
-# If SCRIPT_STATUS is still "SUCCESS", it means all critical steps succeeded.
+# Send final Pushover notification based on SCRIPT_STATUS.
 if [[ "$SCRIPT_STATUS" == "SUCCESS" ]]; then
     NOTIFICATION_TITLE="$HOSTNAME_VAR Backup Status: SUCCESS"
     NOTIFICATION_MESSAGE="Backup job on $HOSTNAME_VAR completed successfully. Total Duration: ${DURATION} seconds."
-    NOTIFICATION_PRIORITY=-1 # Quiet priority
+    NOTIFICATION_PRIORITY=-1 # Quiet notification for success.
     echo "--- $(date) Backup Job Finished successfully in ${DURATION} seconds ---" | tee -a "$LOG_FILE"
     pushover_notify "$NOTIFICATION_TITLE" "$NOTIFICATION_MESSAGE" "$NOTIFICATION_PRIORITY"
 else
-    # Append duration to whatever message was set
+    # If SCRIPT_STATUS is WARNING or FAILURE, use the title/message/priority set during the step that failed/warned.
+    # Append duration to the existing message.
     NOTIFICATION_MESSAGE+=" Total Duration: ${DURATION} seconds."
-    echo "--- $(date) Backup Job Finished with status: $SCRIPT_STATUS ---" | tee -a "$LOG_FILE"
-    # Use previously set NOTIFICATION_TITLE, NOTIFICATION_MESSAGE, NOTIFICATION_PRIORITY
+    echo "--- $(date) Backup Job Finished with status: $SCRIPT_STATUS in ${DURATION} seconds ---" | tee -a "$LOG_FILE"
+    # Ensure default message if none was set (should not happen if logic is correct).
+    if [[ -z "$NOTIFICATION_TITLE" ]]; then
+        NOTIFICATION_TITLE="$HOSTNAME_VAR Backup Status: $SCRIPT_STATUS"
+    fi
+    if [[ -z "$NOTIFICATION_PRIORITY" ]]; then
+        NOTIFICATION_PRIORITY=1 # Default to high priority for any non-success.
+    fi
     pushover_notify "$NOTIFICATION_TITLE" "$NOTIFICATION_MESSAGE" "$NOTIFICATION_PRIORITY"
 fi
 
-# The trap will handle unmounting.
-exit 0 # Script itself exits successfully; Pushover handles alerts.
+# The 'trap cleanup_mounts' will handle unmounting shares.
+# Exit with 0 if successful or warning, 1 if failure, to allow cron to report issues if not using Pushover.
+if [[ "$SCRIPT_STATUS" == "FAILURE" ]]; then
+    exit 1
+else
+    exit 0
+fi
