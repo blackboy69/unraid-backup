@@ -1,8 +1,8 @@
 #!/bin/bash
 pushd .
 cd "${0%/*}"
-sleep 15 # sleep or we end up copying everying over and over again. mergefs needs a bit of time to get started
-
+echo "Sleeping 30 seconds to allow system to settle down after boot..."
+sleep 30 # give the system a bit of time to settle down after boot
 # --- CRITICAL: Set Environment Variables for Cron ---
 # These are essential because cron's environment is minimal.
 # Ensure 'byron' is your actual username.
@@ -58,11 +58,12 @@ source notify.sh
 
 # these two give the best performance really!
 #SOURCE="NAS:" #this is NOT slower, uses SMB is fast af but for some reason time stamps are not working correctly
+SHUTDOWN_AFTER_COPY="true" # set to "true" if you want to shutdown the hotbox after the copy is done
 
 #DESTINATION="local:" # strange this is faster....
 DESTINATION="/mnt/backup" #mergefs is somehow slower than rclone?
              
-SYNC_VERB="sync"  # sync will delete files on the destination but with  --backup-dir  it keeps a backup of the deleted files
+SYNC_VERB="copy"  # sync will delete files on the destination but with  --backup-dir  it keeps a backup of the deleted files
 # SYNC_SOURCE="NAS-ssh:/mnt/user/" # careful with this one, easy to delete files
 # doing a copy using differen tfile ssytems makie sextra data go over the wire.
 
@@ -87,17 +88,20 @@ EXCLUDED_FILES=(
     '.snapshots/**'
     'torrents/**'
     '@revisions/**'
+    '.snapshots/**'
     )
 # Options for concurrent rclone copy operations
 # --multi-thread-streams=0 gives better utilization of disk IO. We're IOPs limited.
-COPY_OPTS="--multi-thread-streams=0 --buffer-size=1G --transfers=1 --metadata --verbose --human-readable --check-first --fast-list"
-SYNC_OPTS="--multi-thread-streams=0 --buffer-size=1G --transfers=2 --metadata --verbose --human-readable --check-first --fast-list --backup-dir /mnt/backup/@revisions/$(date +%F) --order-by=size,mixed "
+COPY_OPTS="--ignore-checksum --multi-thread-streams=0 --buffer-size=1G --transfers=1 --metadata --verbose --human-readable --check-first --fast-list"
+SYNC_OPTS="--ignore-checksum --multi-thread-streams=0 --buffer-size=2G --transfers=2 --metadata --verbose --human-readable --check-first --fast-list"
+
+#--backup-dir=/mnt/backup/@revisions/$(date +%Y-%m-%d) --order-by=size,mixed "
 
 
 # snapper handles snapshots
-# timestamp="@$(date +%Y%m%d_%H%M)" # Using snapshot_name like your original
+# timestamp="$(date +%Y%m%d_%H%M)" # Using snapshot_name like your original
 # for disk_path in $(ls -d /mnt/disk*); do
-#   sudo btrfs subvolume snapshot -r $disk_path $disk_path/$timestamp || {
+#   sudo btrfs subvolume snapshot -r $disk_path $disk_path/@snapshots/$timestamp || {
 #     echo "$(date) ERROR: Failed to create initial snapshot for $disk_path"
 #     #  notify "Snapshot Failure" "Failed to create initial snapshot for $disk_path" 1
 #     exit 1
@@ -113,7 +117,7 @@ SYNC_OPTS="--multi-thread-streams=0 --buffer-size=1G --transfers=2 --metadata --
 
 
 
-# MAX_SNAPSHOTS=3 # Keep this many snapshots per subvolume
+MAX_SNAPSHOTS=3 # Keep this many snapshots per subvolume
 SCRIPT_SUCCESS=0 # 0 = no success yet, 1 = at least one rclone success
 
 EXCLUDES=""
@@ -138,9 +142,15 @@ notify_complete() {
     du_end=$(df /mnt/backup -T | tr -s ' ' | cut -d " " -f5 | tail -1)
     
     gbytes_copied=$(printf "%.2f\n" $((($du_end - $du_start)/1024/1024/1024)))
-
-    ssh vm_shutdown_user@hotbox "sudo shutdown -h +10" # Shutdown the hotbox after 10 minutes
+   
     notify "Backup Success" "INFO: rclone $1 Success. ${gbytes_copied}G delta." 0
+    
+    if [[ $SHUTDOWN_AFTER_COPY == "true" ]]; then
+        echo "$(date) INFO: Shutdown after copy is enabled. Scheduling shutdown."
+        ssh vm_shutdown_user@hotbox "sudo shutdown -h +10" # Shutdown the hotbox after 10 minutes
+    fi
+ 
+    return 0
 }   
 
 # --- Start concurrent rclone copy operations ---
@@ -150,6 +160,7 @@ echo "$(date) INFO: Starting concurrent rclone copy operations..."
 LOG_FILE="/tmp/rclone_consolidated.log" # This is the main log file for all output
 rm ${LOG_FILE} # Clear previous log file if it exists
 mkfifo "${LOG_FILE}"
+
 
 # Start a background process to read from the consolidated log pipe and display output
 cat "${LOG_FILE}" &
