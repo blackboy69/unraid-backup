@@ -28,6 +28,10 @@ source notify.sh
 # This script does not need to be modified when  disks are added or removed on the server or coldstorage!
 # You do need to setup rclone and add disks to the local union
  
+# fdisk -l # to list all disk
+# lsblk # to list all disks and partitions
+# lsblk -f # to list all disks and partitions with filesystem info
+
 # mkfs.btrfs -L BARACUDA_22T_ZXA0D04T /dev/sdg1
 # mkfs.btrfs -L BARACUDA_22T_ZXA064CP /dev/sdf1
 # mkfs.btrfs -L MDD_BARACUDA_18T_000523Q3 /dev/sdc1
@@ -63,16 +67,17 @@ SHUTDOWN_AFTER_COPY="true" # set to "true" if you want to shutdown the hotbox af
 #DESTINATION="local:" # strange this is faster....
 DESTINATION="/mnt/backup" #mergefs is somehow slower than rclone?
              
-SYNC_VERB="copy"  # sync will delete files on the destination but with  --backup-dir  it keeps a backup of the deleted files
+SYNC_VERB="sync"  # sync will delete files on the destination but with  --backup-dir  it keeps a backup of the deleted files
 # SYNC_SOURCE="NAS-ssh:/mnt/user/" # careful with this one, easy to delete files
 # doing a copy using differen tfile ssytems makie sextra data go over the wire.
 
-SYNC_SOURCE="NAS-union:"
+SYNC_SOURCE="NAS-ssh:/mnt/user"
 COPY_SOURCES=(
     #NAS-ssh:/mnt/user/
     # this is for performance, so we can copy from multiple disks/nvme at once
     # REMEMBER it exits when there is only 1 running to go to the copy becase this one has transfers=1
     NAS-ssh:/mnt/cache
+    NAS-ssh:/mnt/spool
     NAS-ssh:/mnt/disk1
     NAS-ssh:/mnt/disk2 
     NAS-ssh:/mnt/disk3 
@@ -88,12 +93,11 @@ EXCLUDED_FILES=(
     '.snapshots/**'
     'torrents/**'
     '@revisions/**'
-    '.snapshots/**'
     )
 # Options for concurrent rclone copy operations
 # --multi-thread-streams=0 gives better utilization of disk IO. We're IOPs limited.
-COPY_OPTS="--ignore-checksum --multi-thread-streams=0 --buffer-size=1G --transfers=1 --metadata --verbose --human-readable --check-first --fast-list"
-SYNC_OPTS="--ignore-checksum --multi-thread-streams=0 --buffer-size=2G --transfers=2 --metadata --verbose --human-readable --check-first --fast-list"
+COPY_OPTS="--multi-thread-streams=0 --buffer-size=1G --transfers=1 --metadata --verbose --human-readable --check-first --fast-list"
+SYNC_OPTS="--multi-thread-streams=0 --buffer-size=2G --transfers=2 --metadata --verbose --human-readable --check-first --fast-list"
 
 #--backup-dir=/mnt/backup/@revisions/$(date +%Y-%m-%d) --order-by=size,mixed "
 
@@ -136,14 +140,23 @@ echo "$(date) INFO: $DESTINATION is mounted. Proceeding with rclone."
 declare -A pids_status # Stores PID as key, "running" or exit code as value
 declare -A pids_log    # Stores PID as key, log file path as value
 
+# Get the initial used space IN BYTES.
+# `df --output=used -B1` is more reliable than `cut`. `tail -n 1` gets the value.
+du_start_bytes=$(df --output=used -B1 /mnt/backup | tail -n 1)
+
 # Function to notify completion with success or failure
-du_start=$(df /mnt/backup -T | tr -s ' ' | cut -d " " -f5 | tail -1)
 notify_complete() {
-    du_end=$(df /mnt/backup -T | tr -s ' ' | cut -d " " -f5 | tail -1)
     
-    gbytes_copied=$(printf "%.2f\n" $((($du_end - $du_start)/1024/1024/1024)))
+    # Get the final used space in bytes.
+    du_end_bytes=$(df --output=used -B1 /mnt/backup | tail -n 1)
+    
+    # Calculate the difference in bytes.
+    bytes_copied=$((du_end_bytes - du_start_bytes))
+
+    # Pass the byte count to `numfmt` and store the formatted result.
+    gbytes_copied=$(echo "$bytes_copied" | numfmt --to=iec --suffix=B --format="%.2f")
    
-    notify "Backup Success" "INFO: rclone $1 Success. ${gbytes_copied}G delta." 0
+    notify "Backup Success" "INFO: rclone $1 Success. ${gbytes_copied} delta." 0
     
     if [[ $SHUTDOWN_AFTER_COPY == "true" ]]; then
         echo "$(date) INFO: Shutdown after copy is enabled. Scheduling shutdown."
@@ -204,7 +217,7 @@ copy_fail=0 # Using your original variable name for failure count
 # Loop until all processes have completed
 while true; do
     # Break loop if no processes are being tracked
-    if [[ ${#pids_status[@]} -le 1 ]]; then
+    if [[ ${#pids_status[@]} -le 0 ]]; then
         break
     fi
 
@@ -253,16 +266,11 @@ else
     echo "$(date) INFO: All rclone copy processes finished successfully."
 fi
 # --- Final Cleanup ---
-# Kill the background cat process for the main LOG_FILE
-kill "$CAT_PID" 2>/dev/null
-# Remove the consolidated named pipe
+# # Remove the consolidated named pipe
 rm "${LOG_FILE}"
 
-
-if [[ ! $SYNC_SOURCE ]]; then
-    echo "$(date) INFO: No sync source specified, skipping rclone sync."
-    notify_complete copy && exit 0
-fi
+# Kill the background cat process for the main LOG_FILE
+kill "$CAT_PID" 2>/dev/null
 
 # need to setup a remote named NAS using rclone config first :)
 # this should ensure random ordering more or less
@@ -276,39 +284,29 @@ RESULT=$(eval "$sync_command")
 sync_exit_code=$?
 if $RESULT; then
     echo "$(date) INFO: rclone success for $SYNC_SOURCE -> $DESTINATION"   # Also log success to file
-    notify_complete sync && exit 0
+    
+
+    # Execute the snapshot script.
+    # We capture the exit code to determine if it succeeded.
+    # The output is not captured in a variable, but you could redirect it to a log file.
+    eval ./snapshot.sh $(printf -- '-p %s ' /mnt/disk*/) -r "$MAX_SNAPSHOTS"
+    exit_code=$?
+
+    # Check the exit code to see if the script was successful
+    if [ $exit_code -ne 0 ]; then
+        echo "$(date): ERROR: Btrfs snapshot script failed with exit code: $exit_code"
+        notify "Btrfs Snapshot Failure" "ERROR: The script failed with exit code $exit_code. Check logs for details."
+    else
+        echo "$(date): INFO: Btrfs snapshot script completed successfully."
+        notify_complete sync && exit 0
+    fi
+    
 else
     echo "$(date) ERROR: rclone failed for  $SYNC_SOURCE -> $DESTINATION (Code: $sync_exit_code)"   # Log error to file
     notify "Backup Failure" "ERROR: rclone sync failed. (Code: $sync_exit_code)" 1
 fi
 
-# # --- Final Cleanup ---
-# # Kill the background cat process for the main LOG_FILE
-# kill "$CAT_PID" 2>/dev/null
-# # Remove the consolidated named pipe
-# rm "${LOG_FILE}"
+# Remove the consolidated named pipe
 
-# snapper handles snapshots
-# for disk_path in $(ls -d /mnt/disk*); do
-#   # Rotate snapshots
-#   echo "$(date) INFO: Rotating snapshots in $disk_path. Keeping $MAX_SNAPSHOTS."
-#   # Using mapfile to read find results into an array
-#   mapfile -t snapshots_array < <(find "$disk_path" -maxdepth 1 -name "@2*" -type d -print | sort)
-#   num_current_snapshots=${#snapshots_array[@]}
-#   if [ "$num_current_snapshots" -gt "$MAX_SNAPSHOTS" ]; then
-#     num_to_delete=$((num_current_snapshots - MAX_SNAPSHOTS))
-#     echo "$(date) INFO: Deleting $num_to_delete oldest snapshot(s)..."
-#     for ((k=0; k<num_to_delete; k++)); do
-#       snapshot_to_delete="${snapshots_array[$k]}"
-#       echo "$(date) INFO: Deleting $snapshot_to_delete"
-#       if ! sudo btrfs subvolume delete "$snapshot_to_delete"; then
-#         echo "$(date) ERROR: Failed to delete "$snapshot_to_delete""
-#         notify "Snapshot Delete Fail" "Failed for "$snapshot_to_delete"" 1
-#       fi
-#     done
-#   else
-#     echo "$(date) INFO: Snapshot count ($num_current_snapshots) okay. No rotation for $disk_path."
-#   fi
-# done
 popd
 echo "$(date) INFO: Backup script finished."
