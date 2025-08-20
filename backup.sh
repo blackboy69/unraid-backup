@@ -83,6 +83,7 @@ COPY_SOURCES=(
     NAS-ssh:/mnt/disk3 
     NAS-ssh:/mnt/disk4 
     NAS-ssh:/mnt/disk5
+    NAS-ssh:/mnt/disk6
     )
 
 EXCLUDED_FILES=(
@@ -96,8 +97,8 @@ EXCLUDED_FILES=(
     )
 # Options for concurrent rclone copy operations
 # --multi-thread-streams=0 gives better utilization of disk IO. We're IOPs limited.
-COPY_OPTS="--multi-thread-streams=0 --buffer-size=1G --transfers=1 --metadata --verbose --human-readable --check-first --fast-list"
-SYNC_OPTS="--multi-thread-streams=0 --buffer-size=2G --transfers=2 --metadata --verbose --human-readable --check-first --fast-list"
+COPY_OPTS="--multi-thread-streams=0 --buffer-size=1G --transfers=1 --metadata --verbose --human-readable --check-first --fast-list --checkers=2 --ignore-checksum"
+SYNC_OPTS="--multi-thread-streams=0 --buffer-size=2G --transfers=2 --metadata --verbose --human-readable --check-first --fast-list --checkers=1"
 
 #--backup-dir=/mnt/backup/@revisions/$(date +%Y-%m-%d) --order-by=size,mixed "
 
